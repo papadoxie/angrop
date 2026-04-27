@@ -1,8 +1,10 @@
 import os
 import re
+import sys
 import time
 import signal
 import logging
+import threading
 import multiprocessing as mp
 from functools import partial
 
@@ -43,39 +45,72 @@ def _set_global_gadget_analyzer(rop_gadget_analyzer):
     process = psutil.Process()
     _global_init_rss = process.memory_info().rss
 
-def alarm_handler(signum, frame): # pylint: disable=unused-argument
-    l.warning("[angrop] worker_func2 times out, exit the worker process!")
-    os._exit(0)
-
 def worker_func1(cslice):
     analyzer = _global_gadget_analyzer
     res = list(GadgetFinder._addresses_from_slice(analyzer, cslice, _global_skip_cache, _global_cache, None))
     return (cslice[1]-cslice[0]+1, res)
 
-def worker_func2(addr, cond_br=None):
-    analyzer = _global_gadget_analyzer
-    signal.signal(signal.SIGALRM, alarm_handler)
-
-    signal.alarm(ANALYZE_GADGET_TIMEOUT)
-    if cond_br is None:
-        res = analyzer.analyze_gadget(addr)
-    else:
-        res = analyzer.analyze_gadget(addr, allow_conditional_branches=cond_br)
-    signal.alarm(0)
-
+def _maybe_exit_for_leak(res):
+    """Kill the worker process if RSS has grown past the leak threshold."""
     if not res:
-        # HACK: we are seeing some very bad memory leak situation, restart the worker
         process = psutil.Process()
         rss = process.memory_info().rss
-        if rss - _global_init_rss > 500*1024*1024:
+        if rss - _global_init_rss > 500*1024*1024: # type: ignore[operator]
             l.warning("[angrop] worker_func2 encounters memory leak, exit the worker process!")
             os._exit(0)
 
+def _normalize_gadget_result(res):
     if res is None:
         return []
     if isinstance(res, list):
         return res
     return [res]
+
+if sys.platform != "win32":
+    def alarm_handler(signum, frame): # pylint: disable=unused-argument
+        l.warning("[angrop] worker_func2 times out, exit the worker process!")
+        os._exit(0)
+
+    def worker_func2(addr, cond_br=None):
+        analyzer = _global_gadget_analyzer
+        signal.signal(signal.SIGALRM, alarm_handler)
+
+        signal.alarm(ANALYZE_GADGET_TIMEOUT)
+        if cond_br is None:
+            res = analyzer.analyze_gadget(addr)
+        else:
+            res = analyzer.analyze_gadget(addr, allow_conditional_branches=cond_br)
+        signal.alarm(0)
+
+        _maybe_exit_for_leak(res)
+        return _normalize_gadget_result(res)
+
+else:
+    # Windows lacks SIGALRM so replicate the kill the worker on timeout
+    # behaviour with a per-call watchdog thread that calls `os._exit(0)`
+    # if the analysis exceeds `ANALYZE_GADGET_TIMEOUT`. `mp.Pool` will
+    # then replace the dead worker, matching the POSIX behaviour.
+    def worker_func2(addr, cond_br=None):
+        analyzer = _global_gadget_analyzer
+        done = threading.Event()
+
+        def watchdog():
+            if not done.wait(ANALYZE_GADGET_TIMEOUT):
+                l.warning("[angrop] worker_func2 times out, exit the worker process!")
+                os._exit(0)
+
+        t = threading.Thread(target=watchdog, daemon=True)
+        t.start()
+        try:
+            if cond_br is None:
+                res = analyzer.analyze_gadget(addr)
+            else:
+                res = analyzer.analyze_gadget(addr, allow_conditional_branches=cond_br)
+        finally:
+            done.set()
+
+        _maybe_exit_for_leak(res)
+        return _normalize_gadget_result(res)
 
 class GadgetFinder:
     """
