@@ -541,6 +541,10 @@ class GadgetAnalyzer:
             gadget = RopGadget(addr=addr)
 
         gadget = self._effect_analysis(gadget, init_state, final_state, ctrl_type, do_cond_branch)
+        if gadget is not None:
+            # tag IBT-legality of the gadget's entry (C2); gadget entries are
+            # instruction-aligned by construction, so the raw-byte compare is sound
+            gadget.has_endbr = self.arch.addr_has_endbr(addr)
         return gadget
 
     def _analyze_concrete_regs(self, final_state, gadget):

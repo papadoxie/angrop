@@ -24,6 +24,11 @@ class RopGadget(RopEffect):
         # for jmp_mem, where it jumps to
         self.pc_target = None # type: ignore
 
+        # whether the gadget's entry address is an endbr instruction (IBT-legal
+        # indirect-branch target). Set explicitly by the gadget analyzer (C2);
+        # the default False is only a placeholder for synthesized gadgets.
+        self.has_endbr = False
+
     @property
     def self_contained(self):
         """
@@ -104,6 +109,7 @@ class RopGadget(RopEffect):
         out.pc_offset = self.pc_offset
         out.pc_reg = self.pc_reg
         out.pc_target = self.pc_target
+        out.has_endbr = self.has_endbr
         return out
 
     def __getstate__(self):
@@ -113,6 +119,8 @@ class RopGadget(RopEffect):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        # tolerate gadget caches pickled before has_endbr existed (C2)
+        self.__dict__.setdefault("has_endbr", False)
 
 class PivotGadget(RopGadget):
     """

@@ -23,7 +23,7 @@ class ROP(Analysis):
 
     def __init__(self, only_check_near_rets=True, max_block_size=None, max_sym_mem_access=None,
                  fast_mode=None, rebase=None, is_thumb=False, kernel_mode=False, stack_gsize=80,
-                 cond_br=False, max_bb_cnt=2
+                 cond_br=False, max_bb_cnt=2, cet=None
                  ):
         """
         Initializes the rop gadget finder
@@ -39,6 +39,9 @@ class ROP(Analysis):
         :param stack_gsize: change the maximum allowable stack change for gadgets, where
                             the max stack_change = stack_gsize * arch.bytes
         :param cond_br: whether to support conditional branches, this option impacts gadget finding speed significantly
+        :param cet: Intel CET configuration. None auto-detects IBT/shadow-stack from the binary's
+                    GNU property note; True forces CET on (x86/amd64 only, builds ret-free JOP chains);
+                    False forces it off (legacy stack/ret behavior).
         :return:
         """
 
@@ -60,7 +63,7 @@ class ROP(Analysis):
         self.gadget_finder = GadgetFinder(self.project, fast_mode=fast_mode, only_check_near_rets=only_check_near_rets,
                                           max_block_size=max_block_size, max_sym_mem_access=max_sym_mem_access,
                                           is_thumb=is_thumb, kernel_mode=kernel_mode, stack_gsize=stack_gsize,
-                                          cond_br=cond_br, max_bb_cnt=max_bb_cnt)
+                                          cond_br=cond_br, max_bb_cnt=max_bb_cnt, cet=cet)
         self.arch = self.gadget_finder.arch
 
         # chain builder
@@ -68,6 +71,16 @@ class ROP(Analysis):
 
         if rebase is not None:
             l.warning("rebase is deprecated in angrop!")
+
+    @property
+    def ibt(self):
+        """whether forward-edge IBT is in effect (indirect targets must be endbr)"""
+        return self.arch.ibt
+
+    @property
+    def shstk(self):
+        """whether a shadow stack is in effect (chains must be ret-free / JOP)"""
+        return self.arch.shstk
 
     def _screen_gadgets(self):
         # screen gadgets based on badbytes and gadget types
