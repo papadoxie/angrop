@@ -567,15 +567,15 @@ class GadgetAnalyzer:
         # than the defining `jmp [Rd-c]` PC read (num_sym_mem_access already excludes it)
         if gadget.mem_writes or gadget.has_symbolic_access():
             return
-        # pc_target must be a single initial register (Rd) plus a constant
-        sregs = [v for v in gadget.pc_target.variables if v.startswith('sreg_')]
-        if len(sregs) != 1:
+        # pc_target must depend on a single initial register (Rd) plus a constant
+        # (get_ast_dependency returns {} if any non-sreg var appears, which correctly
+        # rejects non-register-relative targets)
+        deps = rop_utils.get_ast_dependency(gadget.pc_target)
+        if len(deps) != 1:
             return
-        dispatch_reg = sregs[0][5:].split('-', 1)[0]
+        dispatch_reg = next(iter(deps))
         if not gadget.changed_regs <= {dispatch_reg}:
             return
-
-        bits = self.project.arch.bits
 
         def signed_const(expr):
             # signed constant value of `expr` over the symbolic initial regs, or None
@@ -583,8 +583,7 @@ class GadgetAnalyzer:
             vals = init_state.solver.eval_upto(expr, 2)
             if len(vals) != 1:
                 return None
-            v = vals[0]
-            return v - (1 << bits) if v >= (1 << (bits - 1)) else v
+            return self._to_signed(vals[0])
 
         rd_init = init_state.registers.load(dispatch_reg)
         disp = signed_const(gadget.pc_target - rd_init)

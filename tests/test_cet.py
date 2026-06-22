@@ -240,6 +240,10 @@ def test_stale_cache_retagged_on_load(cet_bin):
     # new process (avoids angr's per-project analysis cache returning `rop` again)
     proj2 = angr.Project(cet_bin, auto_load_libs=False)
     rop2 = proj2.analyses.ROP(cet=True)
+    # isolate the has_endbr (IBT) retag path from the dispatcher-cache (shstk) guard;
+    # has_endbr re-tagging applies on IBT-only binaries too. The 2-tuple here also
+    # exercises backward-compat loading of a pre-3-tuple cache.
+    rop2.arch.shstk = False
     rop2._load_cache_tuple(([g], {}))
     assert g.has_endbr is True, "load must re-tag has_endbr from the binary"
 
@@ -354,6 +358,21 @@ def test_dispatcher_tagging_gated_on_shstk(jop_bin):
     g = _g(rop, "g_disp")
     assert g is not None and g.transit_type == "jmp_mem"
     assert g.is_dispatcher is False
+
+
+def test_cache_built_without_cet_rejected_under_shstk(jop_bin, tmp_path):
+    # a cache built with CET off has no dispatcher tags and they can't be recomputed
+    # on load; loading it under shstk must fail closed, not silently lose dispatchers
+    proj = angr.Project(jop_bin, auto_load_libs=False)
+    rop_off = proj.analyses.ROP(cet=False)
+    rop_off.find_gadgets_single_threaded()
+    cache = str(tmp_path / "nocet.cache")
+    rop_off.save_gadgets(cache)
+
+    proj2 = angr.Project(jop_bin, auto_load_libs=False)
+    rop_on = proj2.analyses.ROP(cet=True)  # shstk -> needs dispatcher tags
+    with pytest.raises(RopException):
+        rop_on.load_gadgets(cache)
 
 
 def test_is_functional_truth_table(jop_rop):

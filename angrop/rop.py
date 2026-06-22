@@ -6,6 +6,7 @@ from typing import cast
 from angr import Analysis, register_analysis
 
 from . import chain_builder
+from .errors import RopException
 from .gadget_finder import GadgetFinder
 from .rop_gadget import RopGadget, PivotGadget, SyscallGadget
 
@@ -192,11 +193,25 @@ class ROP(Analysis):
         all_gadgets = self._all_gadgets
         for g in all_gadgets:
             g.project = None
-        return (all_gadgets, self._duplicates)
+        # record whether dispatcher classification ran at find time (it's gated on
+        # shstk and needs the analysis states, so it can't be redone on load)
+        return (all_gadgets, self._duplicates, self.arch.shstk)
 
     def _load_cache_tuple(self, tup):
         self._all_gadgets = tup[0]
         self._duplicates = tup[1]
+        # dispatcher tags (is_dispatcher/dispatch_*) are only produced under shstk and
+        # cannot be recomputed on load (they need the analysis states). If this run
+        # needs them but the cache was built without CET, fail closed rather than
+        # silently surface zero dispatchers (a JOP build would then report "no chain").
+        # has_endbr below IS recomputed, so it stays correct regardless. (C3)
+        cached_shstk = tup[2] if len(tup) > 2 else False
+        if self.arch.shstk and not cached_shstk:
+            raise RopException(
+                "gadget cache was built without CET/shadow-stack, so it has no JOP "
+                "dispatcher tags; re-run find_gadgets() with cet enabled instead of "
+                "loading this cache"
+            )
         # only matters when CET is active (has_endbr is consulted by the IBT gate /
         # JOP path). Gating here keeps legacy/non-CET loads at zero added cost (C0).
         retag_endbr = self.arch.ibt or self.arch.shstk
