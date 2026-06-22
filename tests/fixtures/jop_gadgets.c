@@ -29,6 +29,12 @@ __asm__(
 "    pop  %rdi\n"
 "    jmp  *%rbx\n"
 ".p2align 4\n"
+".globl g_pop_rdi_ret\n"        /* ret-twin of g_pop_rdi (same body, ret transit) for C4 */
+"g_pop_rdi_ret:\n"
+"    endbr64\n"
+"    pop  %rdi\n"
+"    ret\n"
+".p2align 4\n"
 ".globl g_clobber\n"            /* NOT a dispatcher: also clobbers rcx (changed_regs not subset {rbp}) */
 "g_clobber:\n"
 "    endbr64\n"

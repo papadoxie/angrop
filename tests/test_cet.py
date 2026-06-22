@@ -390,3 +390,33 @@ def test_is_functional_truth_table(jop_rop):
     # the dispatcher itself is jmp_mem, never functional
     disp = _g(jop_rop, "g_disp")
     assert disp.is_functional("rbx", "rbp") is False
+
+
+# --------------------------------------------------------------------------- #
+# C4 - FunctionalBlock effect-equivalence (NOT a RopBlock)
+# --------------------------------------------------------------------------- #
+def test_functional_block_effect_equiv(jop_rop):
+    from angrop.jop_chain import FunctionalBlock
+    from angrop.rop_block import RopBlock
+
+    builder = jop_rop.chain_builder._reg_setter
+    func = _g(jop_rop, "g_pop_rdi")        # endbr; pop rdi; jmp rbx   (R = rbx)
+    twin = _g(jop_rop, "g_pop_rdi_ret")    # endbr; pop rdi; ret       (ret-twin)
+    assert func.transit_type == "jmp_reg" and twin.transit_type == "pop_pc"
+
+    fb = FunctionalBlock.from_gadget(func, builder, "rbx")
+
+    # type invariant: a FunctionalBlock is never a RopBlock (C4)
+    assert not isinstance(fb, RopBlock)
+    # no conditional branches survived analysis (C4 post)
+    assert not fb.branch_dependencies
+
+    # transit-agnostic register/memory effects match the ret-twin
+    assert {p.reg for p in fb.reg_pops} == {p.reg for p in twin.reg_pops} == {"rdi"}
+    assert fb.changed_regs == twin.changed_regs == {"rdi"}
+    assert fb.reg_moves == twin.reg_moves == []
+    assert fb.concrete_regs == twin.concrete_regs
+
+    # the only difference is the ret's pc-pop word: twin.stack_change is one word more
+    assert twin.stack_change - fb.stack_change == jop_rop.project.arch.bytes
+    assert fb.stack_change == func.stack_change  # block matches its single gadget here

@@ -17,6 +17,7 @@ from ..arch import get_arch, X86
 from ..rop_gadget import RopGadget, PivotGadget, SyscallGadget
 from ..rop_effect import RopMemAccess, RopRegMove, RopRegPop
 from ..rop_block import RopBlock
+from ..jop_chain import FunctionalBlock
 from ..errors import RopException, RegNotFoundException, RopTimeoutException
 
 l = logging.getLogger("angrop.gadget_analyzer")
@@ -872,7 +873,7 @@ class GadgetAnalyzer:
         :param symbolic_state: the input symbolic state
         :param gadget: the gadget in which to store the sp change
         """
-        if type(gadget) in (RopGadget, SyscallGadget, RopBlock):
+        if type(gadget) in (RopGadget, SyscallGadget, RopBlock, FunctionalBlock):
             dependencies = self._get_reg_dependencies(final_state, "sp")
             sp_change = final_state.regs.sp - init_state.regs.sp
 
