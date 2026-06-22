@@ -360,9 +360,11 @@ def test_dispatcher_tagging_gated_on_shstk(jop_bin):
     assert g.is_dispatcher is False
 
 
-def test_cache_built_without_cet_rejected_under_shstk(jop_bin, tmp_path):
-    # a cache built with CET off has no dispatcher tags and they can't be recomputed
-    # on load; loading it under shstk must fail closed, not silently lose dispatchers
+def test_cache_built_without_cet_warns_not_raises(jop_bin, tmp_path, caplog):
+    # a cache built with CET off has no dispatcher tags (can't be recomputed on load).
+    # loading it under shstk must NOT raise -- legacy ROP still works -- but must warn
+    # so a later JOP build's "no dispatcher" isn't a surprise.
+    import logging
     proj = angr.Project(jop_bin, auto_load_libs=False)
     rop_off = proj.analyses.ROP(cet=False)
     rop_off.find_gadgets_single_threaded()
@@ -370,9 +372,12 @@ def test_cache_built_without_cet_rejected_under_shstk(jop_bin, tmp_path):
     rop_off.save_gadgets(cache)
 
     proj2 = angr.Project(jop_bin, auto_load_libs=False)
-    rop_on = proj2.analyses.ROP(cet=True)  # shstk -> needs dispatcher tags
-    with pytest.raises(RopException):
-        rop_on.load_gadgets(cache)
+    rop_on = proj2.analyses.ROP(cet=True)  # shstk active
+    with caplog.at_level(logging.WARNING, logger="angrop.rop"):
+        rop_on.load_gadgets(cache, optimize=False)  # must not raise
+    assert any("without CET" in r.message for r in caplog.records)
+    # documented consequence: the load carries no dispatcher tags
+    assert all(not g.is_dispatcher for g in rop_on._all_gadgets)
 
 
 def test_is_functional_truth_table(jop_rop):

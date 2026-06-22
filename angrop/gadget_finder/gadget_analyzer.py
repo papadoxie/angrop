@@ -563,13 +563,14 @@ class GadgetAnalyzer:
             return
         if not gadget.has_endbr or gadget.has_conditional_branch:
             return
-        # register-transparent: no memory writes, and no symbolic memory access other
-        # than the defining `jmp [Rd-c]` PC read (num_sym_mem_access already excludes it)
-        if gadget.mem_writes or gadget.has_symbolic_access():
+        # register-transparent: no memory writes or read-modify-writes (mem_changes),
+        # and no symbolic memory access other than the defining `jmp [Rd-c]` PC read
+        # (num_sym_mem_access already excludes it)
+        if gadget.mem_writes or gadget.mem_changes or gadget.has_symbolic_access():
             return
         # pc_target must depend on a single initial register (Rd) plus a constant
-        # (get_ast_dependency returns {} if any non-sreg var appears, which correctly
-        # rejects non-register-relative targets)
+        # (get_ast_dependency returns an empty set() if any non-sreg var appears, which
+        # correctly rejects non-register-relative targets)
         deps = rop_utils.get_ast_dependency(gadget.pc_target)
         if len(deps) != 1:
             return

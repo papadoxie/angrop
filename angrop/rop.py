@@ -6,7 +6,6 @@ from typing import cast
 from angr import Analysis, register_analysis
 
 from . import chain_builder
-from .errors import RopException
 from .gadget_finder import GadgetFinder
 from .rop_gadget import RopGadget, PivotGadget, SyscallGadget
 
@@ -201,17 +200,15 @@ class ROP(Analysis):
         self._all_gadgets = tup[0]
         self._duplicates = tup[1]
         # dispatcher tags (is_dispatcher/dispatch_*) are only produced under shstk and
-        # cannot be recomputed on load (they need the analysis states). If this run
-        # needs them but the cache was built without CET, fail closed rather than
-        # silently surface zero dispatchers (a JOP build would then report "no chain").
-        # has_endbr below IS recomputed, so it stays correct regardless. (C3)
+        # cannot be recomputed on load (they need the analysis states). A cache built
+        # without CET therefore carries no dispatcher tags. Legacy ROP still works on
+        # such a load (has_endbr is recomputed below), so only warn -- the hard failure
+        # belongs in the JOP orchestrator's "no viable dispatcher" path, not here. (C3)
         cached_shstk = tup[2] if len(tup) > 2 else False
         if self.arch.shstk and not cached_shstk:
-            raise RopException(
-                "gadget cache was built without CET/shadow-stack, so it has no JOP "
-                "dispatcher tags; re-run find_gadgets() with cet enabled instead of "
-                "loading this cache"
-            )
+            l.warning("gadget cache was built without CET/shadow-stack; it has no JOP "
+                      "dispatcher tags. Legacy ROP is unaffected, but JOP chain building "
+                      "will find no dispatcher -- re-run find_gadgets() to repopulate.")
         # only matters when CET is active (has_endbr is consulted by the IBT gate /
         # JOP path). Gating here keeps legacy/non-CET loads at zero added cost (C0).
         retag_endbr = self.arch.ibt or self.arch.shstk

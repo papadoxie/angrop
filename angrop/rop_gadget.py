@@ -150,8 +150,9 @@ class RopGadget(RopEffect):
     def __setstate__(self, state):
         self.__dict__.update(state)
         # tolerate gadget caches pickled before these fields existed (C2/C3).
-        # dispatcher tags can't be recomputed without the analysis states, so a
-        # pre-Phase-1 cache simply surfaces no dispatchers until re-found.
+        # dispatcher tags can't be recomputed without the analysis states, so a cache
+        # built without CET carries no dispatchers; ROP._load_cache_tuple warns about
+        # that under shstk (legacy ROP still works; JOP needs a re-run of find_gadgets).
         self.__dict__.setdefault("has_endbr", False)
         self.__dict__.setdefault("is_dispatcher", False)
         self.__dict__.setdefault("dispatch_reg", None)
