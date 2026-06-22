@@ -420,3 +420,48 @@ def test_functional_block_effect_equiv(jop_rop):
     # the only difference is the ret's pc-pop word: twin.stack_change is one word more
     assert twin.stack_change - fb.stack_change == jop_rop.project.arch.bytes
     assert fb.stack_change == func.stack_change  # block matches its single gadget here
+
+
+# --------------------------------------------------------------------------- #
+# C5/C6 (Phase 2 gate) - a hand-built JOP sequence reaches its goal state
+# --------------------------------------------------------------------------- #
+def test_jop_chain_exec_reaches_goal(jop_rop):
+    from angrop.jop_chain import JopChain
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")  # dispatcher: add rbp,8; jmp [rbp-8]  (delta=0, stride=8)
+    assert D.is_dispatcher and D.dispatch_reg == "rbp"
+    F0 = jop_rop.project.loader.find_symbol("g_pop_rdi").rebased_addr  # pop rdi; jmp rbx
+
+    table_ptr = 0x500000
+    chain = JopChain(jop_rop.project, builder, D, "rbx", table_ptr, [F0])
+    target = 0x4141414242424343
+    chain.add_value(target)  # the value pop rdi pulls off the stack
+
+    final = chain.exec()
+    # goal: rdi holds the popped value, and we are ret-free (ended back at the dispatcher)
+    assert final.solver.eval(final.regs.rdi) == target
+    assert final.solver.eval(final.regs.rip) == D.addr
+
+    # bootstrap preconditions are surfaced, not hidden
+    setup = chain.setup()
+    assert setup["entry_pc"] == D.addr
+    assert setup["initial_regs"]["rbp"] == table_ptr - 0  # Rd = table_ptr - delta
+    assert setup["initial_regs"]["rbx"] == D.addr         # R = D.addr
+    assert setup["table_addrs"] == [F0]
+
+
+def test_jop_chain_fails_closed_on_stack_apis(jop_rop):
+    from angrop.jop_chain import JopChain
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = jop_rop.project.loader.find_symbol("g_pop_rdi").rebased_addr
+    chain = JopChain(jop_rop.project, builder, D, "rbx", 0x500000, [F0])
+    # JOP chains are not flat stack payloads -- these must raise, not silently corrupt
+    with pytest.raises(RopException):
+        chain.payload_str()
+    with pytest.raises(RopException):
+        chain.payload_bv()
+    with pytest.raises(RopException):
+        _ = chain + chain

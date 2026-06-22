@@ -1,5 +1,7 @@
 import logging
 
+import claripy
+
 from .rop_chain import RopChain
 from .rop_block import RopBlock
 from .rop_effect import RopEffect
@@ -119,4 +121,133 @@ class FunctionalBlock(RopChain, RopEffect):
         cp = self.copy_effect(cp)
         cp.R = self.R
         cp._entry_addr = self._entry_addr
+        return cp
+
+
+class JopChain(RopChain):
+    """
+    A ret-free JOP chain. Unlike a RopChain it is **not** a flat stack payload: control
+    flows through an in-memory dispatch table `D -> F0 -> D -> F1 -> ...` (the
+    attacker-staged precondition), while the ordinary stack carries only pop-data. It
+    therefore overrides exec/presentation and *fails closed* on the stack-composition
+    APIs (payload_str/payload_bv/__add__) that would silently corrupt it.
+
+    The bootstrap the attacker must stage (surfaced via `setup()`): entry pc = D, the
+    initial registers (`Rd = table_ptr - delta`, `R = D.addr`), and the dispatch table
+    `[F0, F1, ...]` laid at `table_ptr` at stride `s`. Only `mem_writes` (data like
+    "/bin/sh") are written by the chain itself.
+    """
+
+    def __init__(self, project, builder, dispatcher, R, table_ptr, table_addrs,
+                 state=None, badbytes=None):
+        super().__init__(project, builder, state=state, badbytes=badbytes)
+        self.dispatcher = dispatcher                  # the dispatcher RopGadget D
+        self.R = R                                    # return register (holds D.addr)
+        self.dispatch_reg = dispatcher.dispatch_reg   # Rd
+        self.stride = dispatcher.dispatch_stride      # s
+        self.dispatch_disp = dispatcher.dispatch_disp # delta
+        self.table_ptr = table_ptr                    # where the table is staged
+        self.table_addrs = list(table_addrs)          # ordered functional gadget addrs
+        self.mem_writes = []                          # chain-written data: (addr, bv)
+
+    @property
+    def initial_regs(self):
+        """bootstrap register preconditions: Rd = table_ptr - delta, R = D.addr"""
+        return {self.dispatch_reg: self.table_ptr - self.dispatch_disp,
+                self.R: self.dispatcher.addr}
+
+    def _stage_state(self):
+        """build the entry state: stage the table + data, set the bootstrap registers,
+        enter at D, and lay the stack pop-data. No stack_pop entry (P1)."""
+        project = self._p
+        bits = project.arch.bits
+        arch_bytes = project.arch.bytes
+        endness = project.arch.memory_endness
+        state = self._blank_state.copy()
+
+        # stage the dispatch table -- a precondition, NOT a chain mem_write (P1/C9)
+        for k, addr in enumerate(self.table_addrs):
+            state.memory.store(self.table_ptr + k * self.stride,
+                               claripy.BVV(addr, bits), endness=endness)
+        # data the chain writes (e.g. "/bin/sh", argv); empty until Phase 3
+        for waddr, wdata in self.mem_writes:
+            state.memory.store(waddr, wdata, endness=endness)
+        # bootstrap registers Rd, R
+        for reg, val in self.initial_regs.items():
+            state.registers.store(reg, claripy.BVV(val % (1 << bits), bits))
+        state.ip = self.dispatcher.addr
+        # lay stack pop-data (ordinary stack, allowed under CET)
+        for idx, val in enumerate(self._values):
+            state.memory.store(state.regs.sp + idx * arch_bytes, val.data, arch_bytes,
+                               endness=endness)
+        return state
+
+    def exec(self, timeout=None): # pylint: disable=arguments-differ
+        """
+        Symbolically execute the JOP chain. Control is concrete for a fixed (D, R):
+        `jmp R` -> D, and D's `jmp [Rd-c]` -> the next concrete table entry. So every
+        step yields exactly one successor (C6.6, fail-closed on any fork), and stepping
+        is explicitly bounded to the n functional gadgets -- it would otherwise run off
+        the end of the table.
+        """
+        project = self._p
+        state = self._stage_state()
+        D = self.dispatcher.addr
+        n = len(self.table_addrs)
+
+        simgr = project.factory.simgr(state, save_unconstrained=True)
+        returns_to_D = 0          # number of functional gadgets that have returned to D
+        steps = 0
+        budget = 8 * n + 16       # generous bound for multi-block functional gadgets
+        cur = state
+        while returns_to_D < n:
+            simgr.step()
+            steps += 1
+            succs = simgr.active + simgr.unconstrained
+            if len(succs) != 1:
+                raise RopException("JOP exec: step did not yield a single successor")
+            cur = succs[0]
+            if cur.solver.eval(cur.regs.ip) == D:
+                returns_to_D += 1
+            if steps > budget:
+                raise RopException("JOP exec exceeded step budget")
+        return cur
+
+    def setup(self):
+        """
+        The structured bootstrap the attacker must stage (instead of a flat buffer):
+        entry pc, initial registers, the dispatch table, stride, and chain mem-writes.
+        """
+        return {
+            "entry_pc": self.dispatcher.addr,
+            "initial_regs": self.initial_regs,
+            "table_ptr": self.table_ptr,
+            "table_addrs": list(self.table_addrs),
+            "stride": self.stride,
+            "mem_writes": list(self.mem_writes),
+        }
+
+    # ----- fail closed on stack-composition APIs (would silently corrupt a JOP chain) -----
+    _JOP_NO_STACK = ("JOP chains are not a flat stack payload and compose via the dispatch "
+                     "table, not stack-splicing; use payload_code()/setup()")
+
+    def payload_str(self, *args, **kwargs):
+        raise RopException(self._JOP_NO_STACK)
+
+    def payload_bv(self):
+        raise RopException(self._JOP_NO_STACK)
+
+    def __add__(self, other):
+        raise RopException(self._JOP_NO_STACK)
+
+    def copy(self):
+        cp = super().copy()
+        cp.dispatcher = self.dispatcher
+        cp.R = self.R
+        cp.dispatch_reg = self.dispatch_reg
+        cp.stride = self.stride
+        cp.dispatch_disp = self.dispatch_disp
+        cp.table_ptr = self.table_ptr
+        cp.table_addrs = list(self.table_addrs)
+        cp.mem_writes = list(self.mem_writes)
         return cp
