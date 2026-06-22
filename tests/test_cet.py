@@ -451,6 +451,26 @@ def test_jop_chain_exec_reaches_goal(jop_rop):
     assert setup["table_addrs"] == [F0]
 
 
+def test_jop_build_path_solves_set_rdi(jop_rop):
+    # C5: the JOP build path SOLVES for the stack pop-data given a target register
+    # value (vs the hand-built concrete value above), reusing the shared solving core.
+    from angrop.rop_value import RopValue
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = _g(jop_rop, "g_pop_rdi")  # the RopGadget (pop rdi; jmp rbx)
+    table_ptr = 0x500000
+    target = 0x4142434445464748
+    register_dict = {"rdi": RopValue(target, jop_rop.project)}
+
+    chain = builder._build_jop_chain([F0], D, "rbx", table_ptr, register_dict)
+    assert chain.table_addrs == [F0.addr]
+
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rdi) == target   # solver found the pop-data
+    assert final.solver.eval(final.regs.rip) == D.addr   # ret-free, back at the dispatcher
+
+
 def test_jop_chain_fails_closed_on_stack_apis(jop_rop):
     from angrop.jop_chain import JopChain
 
