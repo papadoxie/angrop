@@ -546,9 +546,9 @@ class GadgetAnalyzer:
             # tag IBT-legality of the gadget's entry (C2); gadget entries are
             # instruction-aligned by construction, so the raw-byte compare is sound
             gadget.has_endbr = self.arch.addr_has_endbr(addr)
-            # JOP dispatcher classification (C3); only under shadow stack (the ret-free
-            # JOP path), so legacy/non-CET discovery pays zero extra solver cost
-            if self.arch.shstk:
+            # JOP dispatcher classification (C3); only when CET is opted into (cet=True),
+            # so legacy/auto-detect discovery pays zero extra solver cost
+            if self.arch.cet_forced:
                 self._tag_dispatcher(gadget, init_state, final_state)
         return gadget
 

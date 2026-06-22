@@ -475,7 +475,20 @@ class RegSetter(Builder):
                                                 modifiable_memory_range,
                                                 registers,
                                                 preserve_regs,
-                                                warn) -> list[list[RopGadget|RopBlock]]:
+                                                warn,
+                                                gadgets=None,
+                                                accept=None,
+                                                handle_hard=True) -> list[list[RopGadget|RopBlock]]:
+        # `gadgets`/`accept`/`handle_hard` parameterize the search so the JOP path can run
+        # the same transit-agnostic graph search over a functional pool. Defaults reproduce
+        # the legacy behavior exactly (relevant gadgets from _reg_setting_dict; keep blocks
+        # and self_contained gadgets, skip non-self_contained jmp gadgets; hard-reg handling
+        # on). The JOP path passes handle_hard=False: _handle_hard_regs consults the *legacy*
+        # _reg_setting_dict (self_contained pops), which never holds functional gadgets, so
+        # it would misclassify functionally-settable regs as hard; the graph search's own
+        # can_set_regs already covers both pops and concrete-value gadgets.
+        if accept is None:
+            accept = lambda g: not (isinstance(g, RopGadget) and not g.self_contained)
         if preserve_regs is None:
             preserve_regs = set()
         else:
@@ -484,8 +497,9 @@ class RegSetter(Builder):
         registers = registers.copy()
 
         # handle hard registers
-        gadgets = self._find_relevant_gadgets(allow_mem_access=modifiable_memory_range is not None, **registers)
-        hard_chain = self._handle_hard_regs(gadgets, registers, preserve_regs)
+        if gadgets is None:
+            gadgets = self._find_relevant_gadgets(allow_mem_access=modifiable_memory_range is not None, **registers)
+        hard_chain = self._handle_hard_regs(gadgets, registers, preserve_regs) if handle_hard else []
         if not registers:
             return [hard_chain]
 
@@ -548,7 +562,7 @@ class RegSetter(Builder):
         # add edges for pops and concrete values
         total_reg_set = set()
         for g in gadgets:
-            if isinstance(g, RopGadget) and not g.self_contained:
+            if not accept(g):
                 continue
             reg_set = can_set_regs(g)
             for unique_reg_set in list(itertools.product(*g.pop_equal_set)):
@@ -747,6 +761,14 @@ class RegSetter(Builder):
 
     #### Main Entrance ####
     def run(self, modifiable_memory_range=None, preserve_regs=None, warn=True, **registers):
+        # when the user opts into CET (cet=True), a stack/ret chain would fault on its
+        # first `ret` under the shadow stack, so route to the ret-free JOP orchestrator
+        # instead (C9). Gated on cet_forced, NOT auto-detected shstk: a binary merely
+        # being CET-compiled must not silently switch ROP-building to JOP. When
+        # cet_forced is False this method is byte-identical to before (C0).
+        if self.arch.cet_forced:
+            return self.chain_builder._jop_setter.set_regs(preserve_regs=preserve_regs, **registers)
+
         if len(registers) == 0:
             return RopChain(self.project, self, badbytes=self.badbytes)
 

@@ -125,13 +125,13 @@ class GadgetFinder:
         self.arch = get_arch(self.project, kernel_mode=kernel_mode)
         # resolve Intel CET (IBT / shadow stack): True forces on, False off, None auto-detects
         self.arch.apply_cet(cet)
-        # under a shadow stack the engine must build ret-free JOP chains, which need
-        # jmp-terminated/dispatcher gadgets the near-ret finder won't reach (P4). Widen
-        # the scan. (shstk is only ever set when CET wasn't force-disabled, so no extra
-        # cet guard is needed here.)
-        if self.arch.shstk:
+        # when CET is opted into (cet=True) the engine builds ret-free JOP chains, which
+        # need jmp-terminated/dispatcher gadgets the near-ret finder won't reach (P4).
+        # Widen the scan. Gated on cet_forced, NOT auto-detected shstk, so a binary
+        # merely being CET-compiled keeps the fast legacy discovery (C0).
+        if self.arch.cet_forced:
             if only_check_near_rets:
-                l.info("shadow stack detected -> scanning the full executable for JOP gadgets")
+                l.info("cet=True -> scanning the full executable for JOP gadgets")
                 only_check_near_rets = False
             # fast_mode filters out jmp-terminated gadgets, which are exactly the
             # functional/dispatcher gadgets JOP relies on. It also auto-enables on large

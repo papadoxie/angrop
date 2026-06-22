@@ -350,14 +350,22 @@ def test_dispatcher_rejects_jmp_reg(jop_rop):
     assert g is not None and g.is_dispatcher is False
 
 
-def test_dispatcher_tagging_gated_on_shstk(jop_bin):
-    # with CET forced off, the dispatcher must NOT be tagged (classification is
-    # gated on shstk so legacy/non-CET discovery is untouched)
+def test_dispatcher_tagging_gated_on_cet_forced(jop_bin):
+    # JOP classification/routing is gated on cet_forced (cet=True opt-in), NOT on
+    # auto-detected shstk -- a binary merely being CET-compiled must stay legacy so
+    # ROP-building on CET binaries is unaffected (C0). jop_bin HAS the CET note.
     proj = angr.Project(jop_bin, auto_load_libs=False)
-    rop = proj.analyses.ROP(cet=False)
-    g = _g(rop, "g_disp")
-    assert g is not None and g.transit_type == "jmp_mem"
-    assert g.is_dispatcher is False
+
+    # cet=False: forced off -> not tagged
+    rop_off = proj.analyses.ROP(cet=False)
+    assert _g(rop_off, "g_disp").is_dispatcher is False
+    assert rop_off.arch.cet_forced is False
+
+    # cet=None on a CET binary: shstk is DETECTED but NOT forced -> still legacy,
+    # dispatcher not tagged (this is the regression guard for the C9 routing gate)
+    rop_auto = angr.Project(jop_bin, auto_load_libs=False).analyses.ROP(cet=None)
+    assert rop_auto.shstk is True and rop_auto.arch.cet_forced is False
+    assert _g(rop_auto, "g_disp").is_dispatcher is False
 
 
 def test_cache_built_without_cet_warns_not_raises(jop_bin, tmp_path, caplog):
@@ -516,6 +524,53 @@ def test_jop_chain_dstr_is_structured(jop_rop):
     s = jc.dstr()
     assert "JOP" in s and "dispatch table" in s and f"{0x500000:#x}" in s
     assert jc.payload_code() == s
+
+
+@pytest.fixture(scope="module")
+def jop_rop_full(jop_bin):
+    # full gadget discovery so chain_builder.gadgets holds the dispatcher + functional pool
+    proj = angr.Project(jop_bin, auto_load_libs=False)
+    rop = proj.analyses.ROP(cet=True)
+    rop.find_gadgets_single_threaded()
+    return rop
+
+
+def test_jop_set_regs_end_to_end(jop_rop_full):
+    # C9 gate: under shstk, rop.set_regs routes to the JOP orchestrator, which selects
+    # a (D, R), searches the functional pool, and emits a ret-free JopChain.
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    chain = rop.set_regs(rdi=0x4141414141414141, rsi=0x4242424242424242)
+    assert isinstance(chain, JopChain)
+
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rdi) == 0x4141414141414141
+    assert final.solver.eval(final.regs.rsi) == 0x4242424242424242
+    # ret-free: control ended back at the dispatcher, and every table entry is endbr (C6)
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+    for addr in chain.table_addrs:
+        g = next(g for g in rop.rop_gadgets if g.addr == addr)
+        assert g.has_endbr and g.is_functional(chain.R, chain.dispatch_reg)
+
+
+def test_jop_negative_stride_table_within_reserved(jop_rop_full):
+    # a sub-based dispatcher has a negative stride; the table grows downward, so the
+    # reserved region must cover the entries (regression: the base wasn't offset, so
+    # entries landed below table_ptr, outside the reserved/zeroed window)
+    from angrop.chain_builder.builder import Builder
+
+    js = jop_rop_full.chain_builder._jop_setter
+    bytes_per = jop_rop_full.project.arch.bytes
+    for n, stride in ((3, 8), (3, -8)):
+        before = list(Builder.used_writable_ptrs)
+        tp = js._alloc_table_ptr(n, stride)
+        new = [x for x in Builder.used_writable_ptrs if x not in before]
+        assert len(new) == 1
+        base, span = new[0]
+        for k in range(n):  # every entry must fit inside the reserved [base, base+span)
+            entry = tp + k * stride
+            assert base <= entry and entry + bytes_per <= base + span
 
 
 def test_jop_chain_fails_closed_on_stack_apis(jop_rop):

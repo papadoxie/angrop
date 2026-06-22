@@ -38,6 +38,12 @@ class ROPArch:
         self.ibt = False
         self.shstk = False
         self.endbr_bytes = None
+        # whether the CET-resistant JOP engine is *opted into* (cet=True). Auto-detected
+        # shstk informs but does NOT change build behavior -- a binary merely being
+        # CET-compiled must not silently switch chain-building to JOP (that would break
+        # legacy ROP-building on CET binaries). JOP routing / dispatcher discovery gate
+        # on this, not on `shstk`.
+        self.cet_forced = False
 
     def addr_has_endbr(self, addr) -> bool:
         """
@@ -63,20 +69,26 @@ class ROPArch:
         """
         if cet is None:
             self.ibt, self.shstk = self._detect_cet()
+            self.cet_forced = False
         elif cet:
             if self.endbr_bytes is None:
                 l.warning("cet=True requested but this architecture has no IBT/endbr support; ignoring")
                 self.ibt = False
                 self.shstk = False
+                self.cet_forced = False
             else:
                 self.ibt = True
                 self.shstk = True
+                self.cet_forced = True
         else:
             self.ibt = False
             self.shstk = False
+            self.cet_forced = False
 
-        if self.shstk:
-            l.warning("shadow stack present -> the engine will build ret-free JOP chains")
+        if self.cet_forced:
+            l.warning("CET forced (cet=True) -> the engine will build ret-free JOP chains")
+        elif self.shstk:
+            l.info("shadow stack detected -> pass cet=True to build ret-free JOP chains")
         elif self.ibt:
             l.info("IBT present -> indirect-branch targets must be endbr")
         return self.ibt, self.shstk

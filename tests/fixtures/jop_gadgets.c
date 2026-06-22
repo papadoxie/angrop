@@ -35,6 +35,18 @@ __asm__(
 "    pop  %rdi\n"
 "    ret\n"
 ".p2align 4\n"
+".globl g_pop_rsi\n"            /* functional: pop rsi; jmp rbx */
+"g_pop_rsi:\n"
+"    endbr64\n"
+"    pop  %rsi\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
+".globl g_pop_rdx\n"            /* functional: pop rdx; jmp rbx */
+"g_pop_rdx:\n"
+"    endbr64\n"
+"    pop  %rdx\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
 ".globl g_clobber\n"            /* NOT a dispatcher: also clobbers rcx (changed_regs not subset {rbp}) */
 "g_clobber:\n"
 "    endbr64\n"
@@ -42,6 +54,8 @@ __asm__(
 "    mov  $0, %rcx\n"
 "    jmp  *-8(%rbp)\n"
 );
-extern void g_disp(void), g_disp_c0(void), g_disp_sub(void), g_pop_rdi(void), g_clobber(void);
-void *keep[] = { g_disp, g_disp_c0, g_disp_sub, g_pop_rdi, g_clobber };
+extern void g_disp(void), g_disp_c0(void), g_disp_sub(void), g_pop_rdi(void),
+            g_pop_rdi_ret(void), g_pop_rsi(void), g_pop_rdx(void), g_clobber(void);
+void *keep[] = { g_disp, g_disp_c0, g_disp_sub, g_pop_rdi, g_pop_rdi_ret,
+                 g_pop_rsi, g_pop_rdx, g_clobber };
 int main(){ return (int)(uintptr_t)keep[0]; }
