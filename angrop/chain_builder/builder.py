@@ -358,6 +358,61 @@ class Builder:
         assert lhs.length == rhs.length
         return lhs, rhs
 
+    def _apply_target_constraints(self, state, register_dict, map_stack_var, constrained_addrs):
+        """
+        The transit-agnostic *solving core*: constrain the final symbolic `state` to the
+        requested register values, and resolve symbolic memory-access addresses to
+        writable pointers -- mapping each solved value onto the stack variable that
+        controls it (via `map_stack_var`). The pop-data stack channel is identical in the
+        stack/ret and JOP transits, so this logic is shared verbatim; it is a behavior-
+        preserving extraction (same constraints, same chains, same solver work) so the
+        legacy path's speed and accuracy are unchanged.
+        """
+        # Constrain final register values.
+        for reg, val in register_dict.items():
+            var = state.registers.load(reg)
+            if val.is_register:
+                if var.op != "BVS" or not next(iter(var.variables)).startswith(
+                    f"sreg_{val.reg_name}-"
+                ):
+                    raise RopException("Register wasn't moved correctly")
+            elif not var.symbolic and not val.symbolic:
+                if var.concrete_value != val.concreted:
+                    raise RopException("Register set to incorrect value")
+            else:
+                state.solver.add(var == val.data)
+                lhs, rhs = self._rebalance_ast(var, val.data)
+                if self.project.arch.memory_endness == 'Iend_LE':
+                    rhs = claripy.Reverse(rhs)
+                ropvalue = val.copy()
+                if val.rebase:
+                    ropvalue._value = rhs - ropvalue._code_base
+                else:
+                    ropvalue._value = rhs
+                map_stack_var(lhs, ropvalue)
+
+        # Constrain memory access addresses.
+        for action in state.history.actions:
+            if action.type == action.MEM and action.addr.symbolic:
+                if len(state.solver.eval_to_ast(action.addr, 2)) == 1:
+                    continue
+                addr_vars = action.addr.ast.variables
+                if len(addr_vars) == 1 and set(addr_vars).pop().startswith("symbolic_stack"):
+                    if constrained_addrs is not None:
+                        ptr_bv = constrained_addrs[0]
+                        constrained_addrs = constrained_addrs[1:]
+                    else:
+                        ptr_bv = claripy.BVV(self._get_ptr_to_writable(action.size.ast//8), action.addr.ast.size())
+                    ropvalue = rop_utils.cast_rop_value(ptr_bv, self.project)
+                    lhs, rhs = self._rebalance_ast(action.addr.ast, ptr_bv)
+                    if self.project.arch.memory_endness == 'Iend_LE':
+                        rhs = claripy.Reverse(rhs)
+                    if ropvalue.rebase:
+                        ropvalue._value = rhs - ropvalue._code_base
+                    else:
+                        ropvalue._value = rhs
+                    map_stack_var(lhs, ropvalue)
+
     @rop_utils.timeout(3)
     def _build_reg_setting_chain(
         self, gadgets, register_dict, constrained_addrs=None):
@@ -448,50 +503,11 @@ class Builder:
         )
         map_stack_var(state.ip, next_pc_val)
 
-        # Constrain final register values.
-        for reg, val in register_dict.items():
-            var = state.registers.load(reg)
-            if val.is_register:
-                if var.op != "BVS" or not next(iter(var.variables)).startswith(
-                    f"sreg_{val.reg_name}-"
-                ):
-                    raise RopException("Register wasn't moved correctly")
-            elif not var.symbolic and not val.symbolic:
-                if var.concrete_value != val.concreted:
-                    raise RopException("Register set to incorrect value")
-            else:
-                state.solver.add(var == val.data)
-                lhs, rhs = self._rebalance_ast(var, val.data)
-                if self.project.arch.memory_endness == 'Iend_LE':
-                    rhs = claripy.Reverse(rhs)
-                ropvalue = val.copy()
-                if val.rebase:
-                    ropvalue._value = rhs - ropvalue._code_base
-                else:
-                    ropvalue._value = rhs
-                map_stack_var(lhs, ropvalue)
-
-        # Constrain memory access addresses.
-        for action in state.history.actions:
-            if action.type == action.MEM and action.addr.symbolic:
-                if len(state.solver.eval_to_ast(action.addr, 2)) == 1:
-                    continue
-                addr_vars = action.addr.ast.variables
-                if len(addr_vars) == 1 and set(addr_vars).pop().startswith("symbolic_stack"):
-                    if constrained_addrs is not None:
-                        ptr_bv = constrained_addrs[0]
-                        constrained_addrs = constrained_addrs[1:]
-                    else:
-                        ptr_bv = claripy.BVV(self._get_ptr_to_writable(action.size.ast//8), action.addr.ast.size())
-                    ropvalue = rop_utils.cast_rop_value(ptr_bv, self.project)
-                    lhs, rhs = self._rebalance_ast(action.addr.ast, ptr_bv)
-                    if self.project.arch.memory_endness == 'Iend_LE':
-                        rhs = claripy.Reverse(rhs)
-                    if ropvalue.rebase:
-                        ropvalue._value = rhs - ropvalue._code_base
-                    else:
-                        ropvalue._value = rhs
-                    map_stack_var(lhs, ropvalue)
+        # Solve: constrain the final state to the requested register values and resolve
+        # symbolic memory addresses. This is the transit-agnostic solving core, shared
+        # verbatim with the JOP path (extracted unchanged, so legacy behavior/speed are
+        # identical).
+        self._apply_target_constraints(state, register_dict, map_stack_var, constrained_addrs)
 
         # now import the constraints from the state that has reached the end of the ropchain
         test_symbolic_state.solver.add(*state.solver.constraints)
@@ -555,6 +571,112 @@ class Builder:
                 raise RuntimeError("???")
         chain.set_gadgets(plain_gadgets)
 
+        return chain
+
+    @rop_utils.timeout(3)
+    def _build_jop_chain(self, functional_gadgets, dispatcher, R, table_ptr,
+                         register_dict, constrained_addrs=None):
+        """
+        JOP-mode chain build (C5). Steps a symbolic state concretely through the
+        dispatcher and the ordered functional gadgets (control is concrete for a fixed
+        (D, R) -- only the pop-data is symbolic), reuses the shared solving core to
+        constrain the requested register values, and emits a JopChain.
+
+        Unlike the stack/ret path: entry is `pc = D` with `Rd = table_ptr - delta` and
+        `R = D.addr` (no stack_pop); the next-gadget channel is the staged dispatch
+        table (concrete addresses), not the stack; and the dispatch table is a
+        precondition, never a chain mem_write (P1). The C6.2 endbr gate replaces the
+        legacy _check_ibt adjacency check (P6), so _check_ibt is not applied here.
+        """
+        from ..jop_chain import JopChain # pylint: disable=import-outside-toplevel
+
+        project = self.project
+        bits = project.arch.bits
+        arch_bytes = project.arch.bytes
+        endness = project.arch.memory_endness
+        D = dispatcher
+        n = len(functional_gadgets)
+
+        # the dispatch machinery registers (R, Rd) are pinned concrete for control flow
+        # and preserved by every functional gadget, so they cannot be chain targets;
+        # reject cleanly rather than failing confusingly in the solving core (C8).
+        if R in register_dict or D.dispatch_reg in register_dict:
+            raise RopException("JOP cannot set the dispatch machinery registers (R/Rd)")
+        if R == D.dispatch_reg or R == self.arch.stack_pointer \
+                or D.dispatch_reg == self.arch.stack_pointer:
+            raise RopException("invalid JOP (D, R): R/Rd alias each other or the stack pointer")
+
+        # size the symbolic stack region exactly like the legacy path -- include each
+        # gadget's out-of-patch reads (max_stack_offset), not just what it pops, so a
+        # functional gadget that reads deeper than it pops still lands on symbolic stack.
+        total_sc = sum(max(g.stack_change, g.max_stack_offset + arch_bytes)
+                       for g in functional_gadgets)
+        state = rop_utils.make_symbolic_state(self.project, self.arch.reg_list,
+                                              total_sc // arch_bytes + 1)
+        test_symbolic_state = state.copy()
+
+        # pop-data stack-var -> solved value (same channel as the stack path; only the
+        # control channel differs)
+        stack_var_to_value = {}
+
+        def map_stack_var(ast, value):
+            if len(ast.variables) != 1:
+                raise RopException("Target value not controlled by a single variable")
+            var = next(iter(ast.variables))
+            if not var.startswith("symbolic_stack_"):
+                raise RopException("Target value not controlled by the stack")
+            stack_var_to_value[var] = value
+
+        # ----- JOP entry: stage the table, set the bootstrap registers, enter at D -----
+        for k, g in enumerate(functional_gadgets):
+            state.memory.store(table_ptr + k * D.dispatch_stride,
+                               claripy.BVV(g.addr, bits), endness=endness)
+        rd_init = (table_ptr - D.dispatch_disp) % (1 << bits)
+        state.registers.store(D.dispatch_reg, claripy.BVV(rd_init, bits))
+        state.registers.store(R, claripy.BVV(D.addr, bits))
+        state.ip = D.addr
+
+        # ----- JOP stepping: concrete flow D->F0->D->...->D, bounded to n gadgets -----
+        # control is concrete, so each step yields exactly one successor (C6.6, fail
+        # closed on any fork); the flow would otherwise run off the end of the table.
+        simgr = project.factory.simgr(state, save_unconstrained=True)
+        returns_to_D = 0
+        steps = 0
+        budget = 8 * n + 16
+        while returns_to_D < n:
+            simgr.step()
+            steps += 1
+            succs = simgr.active + simgr.unconstrained
+            if len(succs) != 1:
+                raise RopException("JOP build: step did not yield a single successor")
+            state = succs[0]
+            if state.solver.eval(state.regs.ip) == D.addr:
+                returns_to_D += 1
+            if steps > budget:
+                raise RopException("JOP build exceeded step budget")
+
+        # ----- solve (shared, transit-agnostic core) -----
+        self._apply_target_constraints(state, register_dict, map_stack_var, constrained_addrs)
+        test_symbolic_state.solver.add(*state.solver.constraints)
+
+        # ----- extract a JopChain: pop-data _values + table_addrs precondition -----
+        chain = JopChain(project, self, D, R, table_ptr,
+                         [g.addr for g in functional_gadgets],
+                         state=test_symbolic_state.copy(), badbytes=self.badbytes)
+        if not chain._blank_state.satisfiable():
+            raise RopException("the JOP chain is not feasible!")
+        for offset in range(0, total_sc, arch_bytes):
+            sym_word = test_symbolic_state.stack_read(offset, arch_bytes)
+            if not sym_word.variables:
+                chain.add_value(sym_word)
+                continue
+            assert len(sym_word.variables) <= 1
+            sym_var = next(iter(sym_word.variables))
+            if sym_var in stack_var_to_value:
+                chain.add_value(stack_var_to_value[sym_var])
+            else:
+                chain.add_value(sym_word)
+        chain.set_gadgets(list(functional_gadgets))
         return chain
 
     def _get_fill_val(self):

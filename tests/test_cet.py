@@ -390,3 +390,145 @@ def test_is_functional_truth_table(jop_rop):
     # the dispatcher itself is jmp_mem, never functional
     disp = _g(jop_rop, "g_disp")
     assert disp.is_functional("rbx", "rbp") is False
+
+
+# --------------------------------------------------------------------------- #
+# C4 - FunctionalBlock effect-equivalence (NOT a RopBlock)
+# --------------------------------------------------------------------------- #
+def test_functional_block_effect_equiv(jop_rop):
+    from angrop.jop_chain import FunctionalBlock
+    from angrop.rop_block import RopBlock
+
+    builder = jop_rop.chain_builder._reg_setter
+    func = _g(jop_rop, "g_pop_rdi")        # endbr; pop rdi; jmp rbx   (R = rbx)
+    twin = _g(jop_rop, "g_pop_rdi_ret")    # endbr; pop rdi; ret       (ret-twin)
+    assert func.transit_type == "jmp_reg" and twin.transit_type == "pop_pc"
+
+    fb = FunctionalBlock.from_gadget(func, builder, "rbx")
+
+    # type invariant: a FunctionalBlock is never a RopBlock (C4)
+    assert not isinstance(fb, RopBlock)
+    # no conditional branches survived analysis (C4 post)
+    assert not fb.branch_dependencies
+
+    # transit-agnostic register/memory effects match the ret-twin
+    assert {p.reg for p in fb.reg_pops} == {p.reg for p in twin.reg_pops} == {"rdi"}
+    assert fb.changed_regs == twin.changed_regs == {"rdi"}
+    assert fb.reg_moves == twin.reg_moves == []
+    assert fb.concrete_regs == twin.concrete_regs
+
+    # the only difference is the ret's pc-pop word: twin.stack_change is one word more
+    assert twin.stack_change - fb.stack_change == jop_rop.project.arch.bytes
+    assert fb.stack_change == func.stack_change  # block matches its single gadget here
+
+
+# --------------------------------------------------------------------------- #
+# C5/C6 (Phase 2 gate) - a hand-built JOP sequence reaches its goal state
+# --------------------------------------------------------------------------- #
+def test_jop_chain_exec_reaches_goal(jop_rop):
+    from angrop.jop_chain import JopChain
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")  # dispatcher: add rbp,8; jmp [rbp-8]  (delta=0, stride=8)
+    assert D.is_dispatcher and D.dispatch_reg == "rbp"
+    F0 = jop_rop.project.loader.find_symbol("g_pop_rdi").rebased_addr  # pop rdi; jmp rbx
+
+    table_ptr = 0x500000
+    chain = JopChain(jop_rop.project, builder, D, "rbx", table_ptr, [F0])
+    target = 0x4141414242424343
+    chain.add_value(target)  # the value pop rdi pulls off the stack
+
+    final = chain.exec()
+    # goal: rdi holds the popped value, and we are ret-free (ended back at the dispatcher)
+    assert final.solver.eval(final.regs.rdi) == target
+    assert final.solver.eval(final.regs.rip) == D.addr
+
+    # bootstrap preconditions are surfaced, not hidden
+    setup = chain.setup()
+    assert setup["entry_pc"] == D.addr
+    assert setup["initial_regs"]["rbp"] == table_ptr - 0  # Rd = table_ptr - delta
+    assert setup["initial_regs"]["rbx"] == D.addr         # R = D.addr
+    assert setup["table_addrs"] == [F0]
+
+
+def test_jop_build_path_solves_set_rdi(jop_rop):
+    # C5: the JOP build path SOLVES for the stack pop-data given a target register
+    # value (vs the hand-built concrete value above), reusing the shared solving core.
+    from angrop.rop_value import RopValue
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = _g(jop_rop, "g_pop_rdi")  # the RopGadget (pop rdi; jmp rbx)
+    table_ptr = 0x500000
+    target = 0x4142434445464748
+    register_dict = {"rdi": RopValue(target, jop_rop.project)}
+
+    chain = builder._build_jop_chain([F0], D, "rbx", table_ptr, register_dict)
+    assert chain.table_addrs == [F0.addr]
+
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rdi) == target   # solver found the pop-data
+    assert final.solver.eval(final.regs.rip) == D.addr   # ret-free, back at the dispatcher
+
+
+def test_jop_chain_and_functionalblock_copy(jop_rop):
+    # copy() must not crash (RopChain.copy reconstructs via a 2-arg ctor; the JOP
+    # subclasses need extra positional args)
+    from angrop.jop_chain import JopChain, FunctionalBlock
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F = _g(jop_rop, "g_pop_rdi")
+
+    fb2 = FunctionalBlock.from_gadget(F, builder, "rbx").copy()
+    assert fb2.R == "rbx" and fb2.changed_regs == {"rdi"}
+
+    jc = JopChain(jop_rop.project, builder, D, "rbx", 0x500000, [F.addr])
+    jc.add_value(0x4142434445464748)
+    jc2 = jc.copy()
+    assert jc2.dispatcher is D and jc2.table_addrs == [F.addr]
+    final = jc2.exec()
+    assert final.solver.eval(final.regs.rdi) == 0x4142434445464748
+
+
+def test_jop_build_rejects_machinery_regs(jop_rop):
+    from angrop.rop_value import RopValue
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = _g(jop_rop, "g_pop_rdi")
+    # requesting Rd (rbp) or R (rbx) as a chain target must raise cleanly, not fail
+    # confusingly inside the solving core
+    with pytest.raises(RopException):
+        builder._build_jop_chain([F0], D, "rbx", 0x500000, {"rbp": RopValue(0, jop_rop.project)})
+    with pytest.raises(RopException):
+        builder._build_jop_chain([F0], D, "rbx", 0x500000, {"rbx": RopValue(0, jop_rop.project)})
+
+
+def test_jop_chain_dstr_is_structured(jop_rop):
+    # presentation must show the table mechanism, not a misleading flat stack view
+    from angrop.jop_chain import JopChain
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = _g(jop_rop, "g_pop_rdi")
+    jc = JopChain(jop_rop.project, builder, D, "rbx", 0x500000, [F0.addr])
+    s = jc.dstr()
+    assert "JOP" in s and "dispatch table" in s and f"{0x500000:#x}" in s
+    assert jc.payload_code() == s
+
+
+def test_jop_chain_fails_closed_on_stack_apis(jop_rop):
+    from angrop.jop_chain import JopChain
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = jop_rop.project.loader.find_symbol("g_pop_rdi").rebased_addr
+    chain = JopChain(jop_rop.project, builder, D, "rbx", 0x500000, [F0])
+    # JOP chains are not flat stack payloads -- these must raise, not silently corrupt
+    with pytest.raises(RopException):
+        chain.payload_str()
+    with pytest.raises(RopException):
+        chain.payload_bv()
+    with pytest.raises(RopException):
+        _ = chain + chain
