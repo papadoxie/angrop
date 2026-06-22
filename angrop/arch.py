@@ -1,6 +1,17 @@
 """
 Architecture-dependent configurations
 """
+import struct
+import logging
+
+l = logging.getLogger(__name__)
+
+# GNU_PROPERTY_X86_FEATURE_1_AND and its IBT/SHSTK bits (see the x86-64 psABI)
+GNU_PROPERTY_X86_FEATURE_1_AND = 0xc0000002
+GNU_PROPERTY_X86_FEATURE_1_IBT = 0x1
+GNU_PROPERTY_X86_FEATURE_1_SHSTK = 0x2
+NT_GNU_PROPERTY_TYPE_0 = 5
+
 
 class ROPArch:
     def __init__(self, project, kernel_mode=False):
@@ -20,6 +31,62 @@ class ROPArch:
         self.ret_insts = None
         self.execve_num = None
         self.sigreturn_num = None
+
+        # Intel CET state. `endbr_bytes` is the architecture's endbr opcode (only
+        # set on x86/amd64); `ibt`/`shstk` reflect whether forward-edge IBT and the
+        # shadow stack are in effect (detected or forced via `apply_cet`).
+        self.ibt = False
+        self.shstk = False
+        self.endbr_bytes = None
+
+    def addr_has_endbr(self, addr) -> bool:
+        """
+        Pure, total predicate: True iff the bytes at `addr` are exactly this arch's
+        endbr opcode. Only meaningful at instruction-entry addresses (gadget entries
+        are, by construction), so a raw-byte compare cannot false-positive on data or
+        mid-instruction bytes. Never raises, never mutates.
+        """
+        if self.endbr_bytes is None:
+            return False
+        try:
+            raw = self.project.loader.memory.load(addr, len(self.endbr_bytes))
+        except Exception: # pylint: disable=broad-except
+            # totality (C1): any load failure (unmapped/partial/bad addr) is "no endbr"
+            return False
+        return bytes(raw) == self.endbr_bytes
+
+    def apply_cet(self, cet):
+        """
+        Resolve the CET configuration. `cet is None` auto-detects from the binary's GNU
+        property note; a truthy `cet` forces it on (only meaningful on x86/amd64); a
+        falsy non-None `cet` forces it off.
+        """
+        if cet is None:
+            self.ibt, self.shstk = self._detect_cet()
+        elif cet:
+            if self.endbr_bytes is None:
+                l.warning("cet=True requested but this architecture has no IBT/endbr support; ignoring")
+                self.ibt = False
+                self.shstk = False
+            else:
+                self.ibt = True
+                self.shstk = True
+        else:
+            self.ibt = False
+            self.shstk = False
+
+        if self.shstk:
+            l.warning("shadow stack present -> the engine will build ret-free JOP chains")
+        elif self.ibt:
+            l.info("IBT present -> indirect-branch targets must be endbr")
+        return self.ibt, self.shstk
+
+    def _detect_cet(self):
+        """
+        Base implementation: no CET support. x86/amd64 override this to parse the
+        GNU_PROPERTY_X86_FEATURE_1_AND note.
+        """
+        return False, False
 
     def _get_reg_list(self):
         """
@@ -51,6 +118,83 @@ class X86(ROPArch):
         self.segment_regs = {"cs", "ds", "es", "fs", "gs", "ss"}
         self.execve_num = 0xb
         self.sigreturn_num = 0x77
+        self.endbr_bytes = b"\xf3\x0f\x1e\xfb" # endbr32
+
+    def _detect_cet(self):
+        mask = self._x86_feature_1_and()
+        if mask is None:
+            return False, False
+        return (bool(mask & GNU_PROPERTY_X86_FEATURE_1_IBT),
+                bool(mask & GNU_PROPERTY_X86_FEATURE_1_SHSTK))
+
+    def _x86_feature_1_and(self):
+        """
+        Return the GNU_PROPERTY_X86_FEATURE_1_AND bitmask from the binary's
+        `.note.gnu.property` note, or None if it can't be found. Tries the mapped
+        section first, then falls back to parsing the file with pyelftools. Defensive
+        throughout: any failure yields None so detection degrades to "CET off".
+        """
+        is_64 = self.project.arch.bits == 64
+        obj = self.project.loader.main_object
+
+        # (a) the mapped .note.gnu.property section
+        try:
+            for sec in getattr(obj, "sections", []):
+                if sec.name != ".note.gnu.property":
+                    continue
+                try:
+                    raw = bytes(self.project.loader.memory.load(sec.vaddr, sec.memsize))
+                except KeyError:
+                    raw = None
+                if raw:
+                    mask = self._parse_gnu_property_note(raw, is_64)
+                    if mask is not None:
+                        return mask
+        except Exception: # pylint: disable=broad-except
+            pass
+
+        # (b)/(c) parse the note straight from the on-disk file via pyelftools
+        try:
+            from elftools.elf.elffile import ELFFile # pylint: disable=import-outside-toplevel
+            path = getattr(obj, "binary", None)
+            if not path:
+                return None
+            with open(path, "rb") as f:
+                sec = ELFFile(f).get_section_by_name(".note.gnu.property")
+                if sec is None:
+                    return None
+                return self._parse_gnu_property_note(sec.data(), is_64)
+        except Exception: # pylint: disable=broad-except
+            return None
+
+    def _parse_gnu_property_note(self, data, is_64):
+        """
+        Parse the raw bytes of a `.note.gnu.property` section and return the
+        GNU_PROPERTY_X86_FEATURE_1_AND mask, or None. Walks the ELF notes, then the
+        program properties inside the matching note.
+        """
+        e = "<" if self.project.arch.memory_endness == "Iend_LE" else ">"
+        off = 0
+        n = len(data)
+        while off + 12 <= n:
+            namesz, descsz, ntype = struct.unpack_from(e + "III", data, off)
+            off += 12
+            name = data[off:off + namesz]
+            off += (namesz + 3) & ~3 # notes are 4-byte aligned
+            desc = data[off:off + descsz]
+            off += (descsz + 3) & ~3
+            if ntype != NT_GNU_PROPERTY_TYPE_0 or name.rstrip(b"\x00") != b"GNU":
+                continue
+            align = 8 if is_64 else 4 # property data alignment is the ELF word size
+            poff = 0
+            while poff + 8 <= len(desc):
+                pr_type, pr_datasz = struct.unpack_from(e + "II", desc, poff)
+                poff += 8
+                pr_data = desc[poff:poff + pr_datasz]
+                poff += (pr_datasz + align - 1) & ~(align - 1)
+                if pr_type == GNU_PROPERTY_X86_FEATURE_1_AND and len(pr_data) >= 4:
+                    return struct.unpack_from(e + "I", pr_data, 0)[0]
+        return None
 
     def _x86_block_make_sense(self, block):
         capstr = str(block.capstone).lower()
@@ -91,6 +235,7 @@ class AMD64(X86):
         self.segment_regs = {"cs_seg", "ds_seg", "es_seg", "fs_seg", "gs_seg", "ss_seg"}
         self.execve_num = 0x3b
         self.sigreturn_num = 0xf
+        self.endbr_bytes = b"\xf3\x0f\x1e\xfa" # endbr64
 
     def block_make_sense(self, block):
         return self._x86_block_make_sense(block)

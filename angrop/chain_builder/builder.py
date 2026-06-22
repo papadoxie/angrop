@@ -367,6 +367,8 @@ class Builder:
         This is done by stepping a symbolic state through each gadget
         then constraining the final registers to the values that were requested
         """
+        # legacy/ROP-path IBT enforcement (C7); inert unless arch.ibt is set
+        self._check_ibt(gadgets)
 
         total_sc = sum(max(g.stack_change, g.max_stack_offset + self.project.arch.bytes) for g in gadgets)
         arch_bytes = self.project.arch.bytes
@@ -632,6 +634,26 @@ class Builder:
                 raise ValueError(f"cannot turn {mixin} into RopBlock!")
         return gadgets
 
+    def _check_ibt(self, gadgets):
+        """
+        Legacy/ROP-path IBT enforcement (C7). On an IBT binary, every indirect branch
+        (`jmp reg`/`jmp [mem]`) must land on an endbr instruction. In a stack/ret chain
+        the real transition after a `jmp_reg`/`jmp_mem` gadget is to the next gadget, so
+        we require that successor to be endbr. No-op unless `arch.ibt` is set.
+
+        This is NOT the JOP gate: under JOP the real transitions go through the
+        dispatcher (Fi->D, D->Fi+1), which C6.2 checks instead (P6).
+        """
+        if not self.arch.ibt:
+            return
+        expanded = self._mixins_to_gadgets(gadgets)
+        for prev, cur in zip(expanded, expanded[1:]):
+            if prev.transit_type in ('jmp_reg', 'jmp_mem') and not cur.has_endbr:
+                raise RopException(
+                    "IBT violation: indirect branch from %#x lands on non-endbr gadget %#x"
+                    % (prev.addr, cur.addr)
+                )
+
     @abstractmethod
     def bootstrap(self):
         """
@@ -734,6 +756,10 @@ class Builder:
             # step1: find a shifter that clean up the jmp_mem call
             # if final_gadget is passed in, then it is the shifter
             if final_gadget:
+                # the jmp_mem gadget branches indirectly to this gadget; under IBT it
+                # must be an endbr target (C7)
+                if self.arch.ibt and not final_gadget.has_endbr:
+                    return None
                 shifter = final_gadget
             else:
                 sc = abs(gadget.stack_change) + self.project.arch.bytes
@@ -747,6 +773,10 @@ class Builder:
                 shifter_list = itertools.chain.from_iterable(shifter_list)
                 for shifter in shifter_list:
                     if shifter.pc_offset < shift_size:
+                        continue
+                    # the jmp_mem gadget branches indirectly to the shifter; under IBT it
+                    # must be an endbr target (C7)
+                    if self.arch.ibt and not shifter.has_endbr:
                         continue
                     if not shifter.changed_regs.intersection(post_preserve):
                         break

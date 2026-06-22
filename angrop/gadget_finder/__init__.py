@@ -118,11 +118,31 @@ class GadgetFinder:
     """
     def __init__(self, project, fast_mode=None, only_check_near_rets=True, max_block_size=None,
                  max_sym_mem_access=None, is_thumb=False, kernel_mode=False, stack_gsize=80,
-                 cond_br=False, max_bb_cnt=2):
+                 cond_br=False, max_bb_cnt=2, cet=None):
         # configurations
         self.project = project
         self.fast_mode = fast_mode
         self.arch = get_arch(self.project, kernel_mode=kernel_mode)
+        # resolve Intel CET (IBT / shadow stack): True forces on, False off, None auto-detects
+        self.arch.apply_cet(cet)
+        # under a shadow stack the engine must build ret-free JOP chains, which need
+        # jmp-terminated/dispatcher gadgets the near-ret finder won't reach (P4). Widen
+        # the scan. (shstk is only ever set when CET wasn't force-disabled, so no extra
+        # cet guard is needed here.)
+        if self.arch.shstk:
+            if only_check_near_rets:
+                l.info("shadow stack detected -> scanning the full executable for JOP gadgets")
+                only_check_near_rets = False
+            # fast_mode filters out jmp-terminated gadgets, which are exactly the
+            # functional/dispatcher gadgets JOP relies on. It also auto-enables on large
+            # binaries, and widening the scan above makes a binary look larger -- so the
+            # JOP pool would silently come back empty. Force it off (or warn if forced on).
+            if self.fast_mode is None:
+                l.info("shadow stack detected -> disabling fast_mode so jmp gadgets are kept")
+                self.fast_mode = False
+            elif self.fast_mode:
+                l.warning("fast_mode filters jmp-terminated gadgets needed for JOP; the "
+                          "functional/dispatcher pool may be empty under shadow stack")
         self.only_check_near_rets = only_check_near_rets
         self.kernel_mode = kernel_mode
         self.stack_gsize = stack_gsize
