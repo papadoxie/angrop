@@ -9,6 +9,7 @@ from .sys_caller import SysCaller
 from .sigreturn import SigreturnBuilder
 from .pivot import Pivot
 from .shifter import Shifter
+from .jop_setter import JopSetter
 from .. import rop_utils
 from ..errors import RopException
 
@@ -51,6 +52,7 @@ class ChainBuilder:
             l.warning("%s is not a fully supported OS, SysCaller may not work on this OS",
                       self.project.loader.main_object.os)
         self._shifter = Shifter(self)
+        self._jop_setter = JopSetter(self)
         self._can_do_write = None
 
     def set_regs(self, *args, **kwargs):

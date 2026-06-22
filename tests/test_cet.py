@@ -518,6 +518,34 @@ def test_jop_chain_dstr_is_structured(jop_rop):
     assert jc.payload_code() == s
 
 
+@pytest.fixture(scope="module")
+def jop_rop_full(jop_bin):
+    # full gadget discovery so chain_builder.gadgets holds the dispatcher + functional pool
+    proj = angr.Project(jop_bin, auto_load_libs=False)
+    rop = proj.analyses.ROP(cet=True)
+    rop.find_gadgets_single_threaded()
+    return rop
+
+
+def test_jop_set_regs_end_to_end(jop_rop_full):
+    # C9 gate: under shstk, rop.set_regs routes to the JOP orchestrator, which selects
+    # a (D, R), searches the functional pool, and emits a ret-free JopChain.
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    chain = rop.set_regs(rdi=0x4141414141414141, rsi=0x4242424242424242)
+    assert isinstance(chain, JopChain)
+
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rdi) == 0x4141414141414141
+    assert final.solver.eval(final.regs.rsi) == 0x4242424242424242
+    # ret-free: control ended back at the dispatcher, and every table entry is endbr (C6)
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+    for addr in chain.table_addrs:
+        g = next(g for g in rop.rop_gadgets if g.addr == addr)
+        assert g.has_endbr and g.is_functional(chain.R, chain.dispatch_reg)
+
+
 def test_jop_chain_fails_closed_on_stack_apis(jop_rop):
     from angrop.jop_chain import JopChain
 
