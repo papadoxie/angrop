@@ -545,7 +545,57 @@ class GadgetAnalyzer:
             # tag IBT-legality of the gadget's entry (C2); gadget entries are
             # instruction-aligned by construction, so the raw-byte compare is sound
             gadget.has_endbr = self.arch.addr_has_endbr(addr)
+            # JOP dispatcher classification (C3); only under shadow stack (the ret-free
+            # JOP path), so legacy/non-CET discovery pays zero extra solver cost
+            if self.arch.shstk:
+                self._tag_dispatcher(gadget, init_state, final_state)
         return gadget
+
+    def _tag_dispatcher(self, gadget, init_state, final_state):
+        """
+        Classify a JOP dispatcher gadget `add Rd, s ; jmp [Rd - c]` (C3). A dispatcher
+        advances a table pointer Rd by a fixed stride and jumps through the next table
+        entry, so it must be register-transparent (changes only Rd + flags, writes no
+        memory) and a branch-free endbr target. On success it sets is_dispatcher and
+        dispatch_reg / dispatch_disp (delta, relative to entry Rd) / dispatch_stride.
+        """
+        if gadget.transit_type != 'jmp_mem' or gadget.pc_target is None:
+            return
+        if not gadget.has_endbr or gadget.has_conditional_branch:
+            return
+        # register-transparent: no memory writes, and no symbolic memory access other
+        # than the defining `jmp [Rd-c]` PC read (num_sym_mem_access already excludes it)
+        if gadget.mem_writes or gadget.has_symbolic_access():
+            return
+        # pc_target must be a single initial register (Rd) plus a constant
+        sregs = [v for v in gadget.pc_target.variables if v.startswith('sreg_')]
+        if len(sregs) != 1:
+            return
+        dispatch_reg = sregs[0][5:].split('-', 1)[0]
+        if not gadget.changed_regs <= {dispatch_reg}:
+            return
+
+        bits = self.project.arch.bits
+
+        def signed_const(expr):
+            # signed constant value of `expr` over the symbolic initial regs, or None
+            # if it isn't constant (eval_upto fails closed: >1 solution => not a const)
+            vals = init_state.solver.eval_upto(expr, 2)
+            if len(vals) != 1:
+                return None
+            v = vals[0]
+            return v - (1 << bits) if v >= (1 << (bits - 1)) else v
+
+        rd_init = init_state.registers.load(dispatch_reg)
+        disp = signed_const(gadget.pc_target - rd_init)
+        stride = signed_const(final_state.registers.load(dispatch_reg) - rd_init)
+        if disp is None or stride is None or stride == 0:
+            return
+
+        gadget.is_dispatcher = True
+        gadget.dispatch_reg = dispatch_reg
+        gadget.dispatch_disp = disp
+        gadget.dispatch_stride = stride
 
     def _analyze_concrete_regs(self, final_state, gadget):
         """

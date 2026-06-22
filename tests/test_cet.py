@@ -82,6 +82,14 @@ def nocet_bin(tmp_path_factory):
     return _build("nocet.c", out, flags)
 
 
+@pytest.fixture(scope="session")
+def jop_bin(tmp_path_factory):
+    if not _gcc_supports_cf_protection():
+        pytest.skip("gcc with -fcf-protection not available")
+    out = str(tmp_path_factory.mktemp("jop") / "jop_gadgets")
+    return _build("jop_gadgets.c", out, ["-fcf-protection=full", "-O0", "-no-pie"])
+
+
 def _arch(path):
     return get_arch(angr.Project(path, auto_load_libs=False))
 
@@ -294,3 +302,67 @@ def test_check_ibt_pass(builder):
 def test_noncet_detects_off(nocet_bin):
     rop = angr.Project(nocet_bin, auto_load_libs=False).analyses.ROP()  # auto-detect
     assert rop.ibt is False and rop.shstk is False
+
+
+# --------------------------------------------------------------------------- #
+# C3 - dispatcher classification + is_functional predicate
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def jop_rop(jop_bin):
+    proj = angr.Project(jop_bin, auto_load_libs=False)
+    return proj.analyses.ROP(cet=True)  # shstk=True -> dispatcher tagging active
+
+
+def _g(rop, name):
+    return rop.analyze_gadget(rop.project.loader.find_symbol(name).rebased_addr)
+
+
+@pytest.mark.parametrize("name,reg,disp,stride", [
+    ("g_disp", "rbp", 0, 8),       # add rbp,8; jmp [rbp-8]  -> delta = s-c = 0
+    ("g_disp_c0", "rbp", 8, 8),    # add rbp,8; jmp [rbp]    -> delta = s   = 8
+    ("g_disp_sub", "rbp", 0, -8),  # sub rbp,8; jmp [rbp+8]  -> negative stride
+])
+def test_dispatcher_detect(jop_rop, name, reg, disp, stride):
+    g = _g(jop_rop, name)
+    assert g is not None
+    assert g.is_dispatcher is True
+    assert g.dispatch_reg == reg
+    assert g.dispatch_disp == disp
+    assert g.dispatch_stride == stride
+    # C3 invariant
+    assert g.transit_type == "jmp_mem" and g.has_endbr and not g.has_conditional_branch
+    assert g.dispatch_stride != 0
+
+
+def test_dispatcher_rejects_non_transparent(jop_rop):
+    # g_clobber also writes rcx, so changed_regs is not a subset of {Rd}
+    g = _g(jop_rop, "g_clobber")
+    assert g is not None and g.transit_type == "jmp_mem"
+    assert g.is_dispatcher is False
+
+
+def test_dispatcher_rejects_jmp_reg(jop_rop):
+    g = _g(jop_rop, "g_pop_rdi")  # functional gadget, not a dispatcher
+    assert g is not None and g.is_dispatcher is False
+
+
+def test_dispatcher_tagging_gated_on_shstk(jop_bin):
+    # with CET forced off, the dispatcher must NOT be tagged (classification is
+    # gated on shstk so legacy/non-CET discovery is untouched)
+    proj = angr.Project(jop_bin, auto_load_libs=False)
+    rop = proj.analyses.ROP(cet=False)
+    g = _g(rop, "g_disp")
+    assert g is not None and g.transit_type == "jmp_mem"
+    assert g.is_dispatcher is False
+
+
+def test_is_functional_truth_table(jop_rop):
+    pop_rdi = _g(jop_rop, "g_pop_rdi")  # endbr; pop rdi; jmp rbx
+    assert pop_rdi.is_functional("rbx", "rbp") is True
+    # wrong return register
+    assert pop_rdi.is_functional("rax", "rbp") is False
+    # dispatch reg clobbered (rdi is popped/changed)
+    assert pop_rdi.is_functional("rbx", "rdi") is False
+    # the dispatcher itself is jmp_mem, never functional
+    disp = _g(jop_rop, "g_disp")
+    assert disp.is_functional("rbx", "rbp") is False
