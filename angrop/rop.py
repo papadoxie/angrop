@@ -197,8 +197,17 @@ class ROP(Analysis):
     def _load_cache_tuple(self, tup):
         self._all_gadgets = tup[0]
         self._duplicates = tup[1]
+        # only matters when CET is active (has_endbr is consulted by the IBT gate /
+        # JOP path). Gating here keeps legacy/non-CET loads at zero added cost (C0).
+        retag_endbr = self.arch.ibt or self.arch.shstk
         for g in self._all_gadgets:
             g.project = self.project
+            # re-tag IBT-legality from the binary (the source of truth). A cache
+            # pickled before has_endbr existed defaults every gadget to False, which
+            # on an IBT binary would cause false IBT violations and drop valid
+            # shifters; recomputing here keeps cached gadgets correct (C2).
+            if retag_endbr:
+                g.has_endbr = self.arch.addr_has_endbr(g.addr)
         self._screen_gadgets()
 
     def save_gadgets(self, path):

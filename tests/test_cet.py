@@ -208,6 +208,25 @@ def test_has_endbr_survives_pickle(cet_rop):
     assert g2.has_endbr == g.has_endbr is True
 
 
+def test_stale_cache_retagged_on_load(cet_bin):
+    # a gadget cache pickled before has_endbr existed loads with has_endbr=False on
+    # every gadget; on an IBT binary that must be re-tagged from the binary at load
+    # time, not left False (else false IBT violations / dropped shifters). C2.
+    proj = angr.Project(cet_bin, auto_load_libs=False)
+    rop = proj.analyses.ROP(cet=True)
+    entry = _endbr_entry(proj)
+    g = rop.analyze_gadget(entry)
+    assert g is not None and g.has_endbr is True
+
+    # simulate a stale cache entry: tag cleared (as the old default would leave it)
+    g.has_endbr = False
+    g.project = None
+
+    rop2 = proj.analyses.ROP(cet=True)
+    rop2._load_cache_tuple(([g], {}))
+    assert g.has_endbr is True, "load must re-tag has_endbr from the binary"
+
+
 # --------------------------------------------------------------------------- #
 # C7 - legacy IBT enforcement (Builder._check_ibt)
 # --------------------------------------------------------------------------- #
