@@ -29,6 +29,16 @@ class RopGadget(RopEffect):
         # the default False is only a placeholder for synthesized gadgets.
         self.has_endbr = False
 
+        # JOP dispatcher classification (C3): a dispatcher `add Rd,s; jmp [Rd-c]`
+        # advances a table pointer Rd by `dispatch_stride` and jumps through the next
+        # table entry; `dispatch_disp` (delta) is pc_target's offset relative to the
+        # entry Rd. Set by the gadget analyzer; needs the analysis states, so it is
+        # NOT recomputed on cache load (defaults below stand for non-dispatchers).
+        self.is_dispatcher = False
+        self.dispatch_reg: str = None # type: ignore
+        self.dispatch_disp: int = None # type: ignore
+        self.dispatch_stride: int = None # type: ignore
+
     @property
     def self_contained(self):
         """
@@ -37,6 +47,22 @@ class RopGadget(RopEffect):
         (a gadget like mov rax, [rsp]; add rsp, 8; jmp rax will be considered pop_pc)
         """
         return (not self.has_conditional_branch) and self.transit_type == 'pop_pc' and not self.oop
+
+    def is_functional(self, R, dispatch_reg):
+        """
+        JOP analog of `self_contained` (C3): a *pure predicate*, True iff this gadget
+        can serve as a functional dispatch-table entry for a dispatcher whose return
+        register is `R` and dispatch register is `dispatch_reg`. It must transfer via
+        `jmp R`, be a legal endbr indirect target, be branch-free, and preserve the
+        dispatch machinery (R and Rd). Functional gadgets may otherwise pop off the
+        stack and touch other registers/memory freely.
+        """
+        return (self.transit_type == 'jmp_reg'
+                and self.pc_reg == R
+                and self.has_endbr
+                and not self.has_conditional_branch
+                and R not in self.changed_regs
+                and dispatch_reg not in self.changed_regs)
 
     def dstr(self) -> str:
         return "; ".join(addr_to_asmstring(self.project, addr) for addr in self.bbl_addrs)
@@ -110,6 +136,10 @@ class RopGadget(RopEffect):
         out.pc_reg = self.pc_reg
         out.pc_target = self.pc_target
         out.has_endbr = self.has_endbr
+        out.is_dispatcher = self.is_dispatcher
+        out.dispatch_reg = self.dispatch_reg
+        out.dispatch_disp = self.dispatch_disp
+        out.dispatch_stride = self.dispatch_stride
         return out
 
     def __getstate__(self):
@@ -119,8 +149,15 @@ class RopGadget(RopEffect):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        # tolerate gadget caches pickled before has_endbr existed (C2)
+        # tolerate gadget caches pickled before these fields existed (C2/C3).
+        # dispatcher tags can't be recomputed without the analysis states, so a cache
+        # built without CET carries no dispatchers; ROP._load_cache_tuple warns about
+        # that under shstk (legacy ROP still works; JOP needs a re-run of find_gadgets).
         self.__dict__.setdefault("has_endbr", False)
+        self.__dict__.setdefault("is_dispatcher", False)
+        self.__dict__.setdefault("dispatch_reg", None)
+        self.__dict__.setdefault("dispatch_disp", None)
+        self.__dict__.setdefault("dispatch_stride", None)
 
 class PivotGadget(RopGadget):
     """

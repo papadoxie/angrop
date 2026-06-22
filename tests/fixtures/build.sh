@@ -4,6 +4,7 @@
 # committed -- they are .gitignored here. Requires a gcc with -fcf-protection.
 set -e
 cd "$(dirname "$0")"
-gcc -fcf-protection=full -O1 -no-pie cet_probe.c -o cet_probe
-gcc -fcf-protection=none -O1 -no-pie nocet.c     -o nocet
-echo "built cet_probe (IBT+SHSTK note) and nocet (no note)"
+gcc -fcf-protection=full -O1 -no-pie cet_probe.c   -o cet_probe
+gcc -fcf-protection=none -O1 -no-pie nocet.c       -o nocet
+gcc -fcf-protection=full -O0 -no-pie jop_gadgets.c -o jop_gadgets
+echo "built cet_probe (IBT+SHSTK note), nocet (no note), jop_gadgets (dispatcher/functional shapes)"
