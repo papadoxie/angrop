@@ -117,10 +117,20 @@ class FunctionalBlock(RopChain, RopEffect):
         return fb
 
     def copy(self):
-        cp = super().copy()
-        cp = self.copy_effect(cp)
-        cp.R = self.R
+        # NOT via super().copy(): RopChain.copy() reconstructs with the 2-arg
+        # (project, builder) constructor, but FunctionalBlock.__init__ needs `R`.
+        # Construct correctly, then mirror RopChain.copy()'s state copy + effect copy.
+        cp = FunctionalBlock(self._p, self._builder, self.R)
+        cp._gadgets = list(self._gadgets)
+        cp._values = list(self._values)
+        cp.payload_len = self.payload_len
+        cp._blank_state = self._blank_state.copy()
+        cp.badbytes = self.badbytes
+        cp._sigreturn_frame = self._sigreturn_frame
+        cp._pivoted = self._pivoted
+        cp._init_sp = self._init_sp
         cp._entry_addr = self._entry_addr
+        self.copy_effect(cp)
         return cp
 
 
@@ -227,6 +237,35 @@ class JopChain(RopChain):
             "mem_writes": list(self.mem_writes),
         }
 
+    def dstr(self):
+        """
+        Structured JOP representation -- the dispatch table, the bootstrap registers, and
+        the stack pop-data. Overrides RopChain.dstr (which assumes _values are on-stack
+        gadget addresses) so str()/printing a JopChain doesn't emit a misleading flat
+        stack view that hides the entire table mechanism.
+        """
+        lines = ["# ret-free JOP chain (composes via the dispatch table, not the stack)",
+                 "# attacker-staged bootstrap:",
+                 f"#   entry pc = {self.dispatcher.addr:#x}"]
+        for reg, val in self.initial_regs.items():
+            lines.append(f"#   {reg} = {val:#x}")
+        lines.append(f"# dispatch table @ {self.table_ptr:#x} (stride {self.stride:#x}):")
+        for k, addr in enumerate(self.table_addrs):
+            asm = self.addr_to_asmstring(addr)
+            lines.append(f"#   table[{k}] = {addr:#x}" + (f"  ; {asm}" if asm else ""))
+        if self.mem_writes:
+            lines.append("# chain-written data:")
+            for addr, data in self.mem_writes:
+                lines.append(f"#   [{addr:#x}] = {data!r}")
+        lines.append("# stack pop-data:")
+        for v in self._values:
+            lines.append(f"#   {v.ast}" if v.symbolic else f"#   {v.concreted:#x}")
+        return "\n".join(lines) + "\n"
+
+    def payload_code(self, *args, **kwargs): # pylint: disable=arguments-differ
+        """JOP chains are not a flat buffer; present the structured bootstrap instead."""
+        return self.dstr()
+
     # ----- fail closed on stack-composition APIs (would silently corrupt a JOP chain) -----
     _JOP_NO_STACK = ("JOP chains are not a flat stack payload and compose via the dispatch "
                      "table, not stack-splicing; use payload_code()/setup()")
@@ -241,13 +280,18 @@ class JopChain(RopChain):
         raise RopException(self._JOP_NO_STACK)
 
     def copy(self):
-        cp = super().copy()
-        cp.dispatcher = self.dispatcher
-        cp.R = self.R
-        cp.dispatch_reg = self.dispatch_reg
-        cp.stride = self.stride
-        cp.dispatch_disp = self.dispatch_disp
-        cp.table_ptr = self.table_ptr
-        cp.table_addrs = list(self.table_addrs)
+        # NOT via super().copy(): RopChain.copy() reconstructs with the 2-arg
+        # (project, builder) constructor, but JopChain.__init__ needs the dispatcher,
+        # R, table_ptr and table_addrs. Construct correctly, then mirror RopChain.copy().
+        cp = JopChain(self._p, self._builder, self.dispatcher, self.R, self.table_ptr,
+                      list(self.table_addrs))
+        cp._gadgets = list(self._gadgets)
+        cp._values = list(self._values)
+        cp.payload_len = self.payload_len
+        cp._blank_state = self._blank_state.copy()
+        cp.badbytes = self.badbytes
+        cp._sigreturn_frame = self._sigreturn_frame
+        cp._pivoted = self._pivoted
+        cp._init_sp = self._init_sp
         cp.mem_writes = list(self.mem_writes)
         return cp

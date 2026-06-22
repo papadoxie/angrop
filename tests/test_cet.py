@@ -471,6 +471,53 @@ def test_jop_build_path_solves_set_rdi(jop_rop):
     assert final.solver.eval(final.regs.rip) == D.addr   # ret-free, back at the dispatcher
 
 
+def test_jop_chain_and_functionalblock_copy(jop_rop):
+    # copy() must not crash (RopChain.copy reconstructs via a 2-arg ctor; the JOP
+    # subclasses need extra positional args)
+    from angrop.jop_chain import JopChain, FunctionalBlock
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F = _g(jop_rop, "g_pop_rdi")
+
+    fb2 = FunctionalBlock.from_gadget(F, builder, "rbx").copy()
+    assert fb2.R == "rbx" and fb2.changed_regs == {"rdi"}
+
+    jc = JopChain(jop_rop.project, builder, D, "rbx", 0x500000, [F.addr])
+    jc.add_value(0x4142434445464748)
+    jc2 = jc.copy()
+    assert jc2.dispatcher is D and jc2.table_addrs == [F.addr]
+    final = jc2.exec()
+    assert final.solver.eval(final.regs.rdi) == 0x4142434445464748
+
+
+def test_jop_build_rejects_machinery_regs(jop_rop):
+    from angrop.rop_value import RopValue
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = _g(jop_rop, "g_pop_rdi")
+    # requesting Rd (rbp) or R (rbx) as a chain target must raise cleanly, not fail
+    # confusingly inside the solving core
+    with pytest.raises(RopException):
+        builder._build_jop_chain([F0], D, "rbx", 0x500000, {"rbp": RopValue(0, jop_rop.project)})
+    with pytest.raises(RopException):
+        builder._build_jop_chain([F0], D, "rbx", 0x500000, {"rbx": RopValue(0, jop_rop.project)})
+
+
+def test_jop_chain_dstr_is_structured(jop_rop):
+    # presentation must show the table mechanism, not a misleading flat stack view
+    from angrop.jop_chain import JopChain
+
+    builder = jop_rop.chain_builder._reg_setter
+    D = _g(jop_rop, "g_disp")
+    F0 = _g(jop_rop, "g_pop_rdi")
+    jc = JopChain(jop_rop.project, builder, D, "rbx", 0x500000, [F0.addr])
+    s = jc.dstr()
+    assert "JOP" in s and "dispatch table" in s and f"{0x500000:#x}" in s
+    assert jc.payload_code() == s
+
+
 def test_jop_chain_fails_closed_on_stack_apis(jop_rop):
     from angrop.jop_chain import JopChain
 

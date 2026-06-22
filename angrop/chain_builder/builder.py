@@ -597,7 +597,20 @@ class Builder:
         D = dispatcher
         n = len(functional_gadgets)
 
-        total_sc = sum(max(g.stack_change, 0) for g in functional_gadgets)
+        # the dispatch machinery registers (R, Rd) are pinned concrete for control flow
+        # and preserved by every functional gadget, so they cannot be chain targets;
+        # reject cleanly rather than failing confusingly in the solving core (C8).
+        if R in register_dict or D.dispatch_reg in register_dict:
+            raise RopException("JOP cannot set the dispatch machinery registers (R/Rd)")
+        if R == D.dispatch_reg or R == self.arch.stack_pointer \
+                or D.dispatch_reg == self.arch.stack_pointer:
+            raise RopException("invalid JOP (D, R): R/Rd alias each other or the stack pointer")
+
+        # size the symbolic stack region exactly like the legacy path -- include each
+        # gadget's out-of-patch reads (max_stack_offset), not just what it pops, so a
+        # functional gadget that reads deeper than it pops still lands on symbolic stack.
+        total_sc = sum(max(g.stack_change, g.max_stack_offset + arch_bytes)
+                       for g in functional_gadgets)
         state = rop_utils.make_symbolic_state(self.project, self.arch.reg_list,
                                               total_sc // arch_bytes + 1)
         test_symbolic_state = state.copy()
