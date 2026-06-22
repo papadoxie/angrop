@@ -50,20 +50,20 @@ class ROPArch:
             return False
         try:
             raw = self.project.loader.memory.load(addr, len(self.endbr_bytes))
-        except KeyError:
+        except Exception: # pylint: disable=broad-except
+            # totality (C1): any load failure (unmapped/partial/bad addr) is "no endbr"
             return False
         return bytes(raw) == self.endbr_bytes
 
     def apply_cet(self, cet):
         """
-        Resolve the CET configuration. `cet is True` forces it on (only meaningful on
-        x86/amd64); `cet is False` forces it off; `cet is None` auto-detects from the
-        binary's GNU property note.
+        Resolve the CET configuration. `cet is None` auto-detects from the binary's GNU
+        property note; a truthy `cet` forces it on (only meaningful on x86/amd64); a
+        falsy non-None `cet` forces it off.
         """
-        if cet is False:
-            self.ibt = False
-            self.shstk = False
-        elif cet is True:
+        if cet is None:
+            self.ibt, self.shstk = self._detect_cet()
+        elif cet:
             if self.endbr_bytes is None:
                 l.warning("cet=True requested but this architecture has no IBT/endbr support; ignoring")
                 self.ibt = False
@@ -72,7 +72,8 @@ class ROPArch:
                 self.ibt = True
                 self.shstk = True
         else:
-            self.ibt, self.shstk = self._detect_cet()
+            self.ibt = False
+            self.shstk = False
 
         if self.shstk:
             l.warning("shadow stack present -> the engine will build ret-free JOP chains")

@@ -127,8 +127,9 @@ class GadgetFinder:
         self.arch.apply_cet(cet)
         # under a shadow stack the engine must build ret-free JOP chains, which need
         # jmp-terminated/dispatcher gadgets the near-ret finder won't reach (P4). Widen
-        # the scan unless the caller explicitly asked to keep it narrow.
-        if self.arch.shstk and cet is not False:
+        # the scan. (shstk is only ever set when CET wasn't force-disabled, so no extra
+        # cet guard is needed here.)
+        if self.arch.shstk:
             if only_check_near_rets:
                 l.info("shadow stack detected -> scanning the full executable for JOP gadgets")
                 only_check_near_rets = False

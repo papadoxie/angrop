@@ -1,9 +1,9 @@
 #!/bin/sh
-# Rebuild the CET test fixtures. Requires a gcc with -fcf-protection support.
+# Build the CET test fixtures locally (for debugging only). The test suite builds
+# these at runtime into a temp dir via tests/test_cet.py, so the binaries are not
+# committed -- they are .gitignored here. Requires a gcc with -fcf-protection.
 set -e
 cd "$(dirname "$0")"
-gcc -fcf-protection=full -O1 -static            cet_probe.c -o cet_probe
-gcc -fcf-protection=none -O1 -static            nocet.c     -o nocet
-# spike: exact COP/pivot/shift gadget shapes (endbr; call rax; jmp rbx, etc.)
-gcc -fcf-protection=full -O0 -static -no-pie     spike.c     -o spike
-echo "built cet_probe (IBT+SHSTK), nocet (no note), spike (JOP gadget shapes)"
+gcc -fcf-protection=full -O1 -no-pie cet_probe.c -o cet_probe
+gcc -fcf-protection=none -O1 -no-pie nocet.c     -o nocet
+echo "built cet_probe (IBT+SHSTK note) and nocet (no note)"

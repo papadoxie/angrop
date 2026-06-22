@@ -1,0 +1,4 @@
+# built test fixtures -- never commit binaries; test_cet.py builds them at runtime
+cet_probe
+nocet
+spike
