@@ -477,11 +477,16 @@ class RegSetter(Builder):
                                                 preserve_regs,
                                                 warn,
                                                 gadgets=None,
-                                                accept=None) -> list[list[RopGadget|RopBlock]]:
-        # `gadgets`/`accept` parameterize the search so the JOP path can run the same
-        # transit-agnostic graph search over a functional pool. Defaults reproduce the
-        # legacy behavior exactly (relevant gadgets from _reg_setting_dict; keep blocks
-        # and self_contained gadgets, skip non-self_contained jmp_reg/jmp_mem gadgets).
+                                                accept=None,
+                                                handle_hard=True) -> list[list[RopGadget|RopBlock]]:
+        # `gadgets`/`accept`/`handle_hard` parameterize the search so the JOP path can run
+        # the same transit-agnostic graph search over a functional pool. Defaults reproduce
+        # the legacy behavior exactly (relevant gadgets from _reg_setting_dict; keep blocks
+        # and self_contained gadgets, skip non-self_contained jmp gadgets; hard-reg handling
+        # on). The JOP path passes handle_hard=False: _handle_hard_regs consults the *legacy*
+        # _reg_setting_dict (self_contained pops), which never holds functional gadgets, so
+        # it would misclassify functionally-settable regs as hard; the graph search's own
+        # can_set_regs already covers both pops and concrete-value gadgets.
         if accept is None:
             accept = lambda g: not (isinstance(g, RopGadget) and not g.self_contained)
         if preserve_regs is None:
@@ -494,7 +499,7 @@ class RegSetter(Builder):
         # handle hard registers
         if gadgets is None:
             gadgets = self._find_relevant_gadgets(allow_mem_access=modifiable_memory_range is not None, **registers)
-        hard_chain = self._handle_hard_regs(gadgets, registers, preserve_regs)
+        hard_chain = self._handle_hard_regs(gadgets, registers, preserve_regs) if handle_hard else []
         if not registers:
             return [hard_chain]
 

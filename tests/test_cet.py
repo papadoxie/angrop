@@ -554,6 +554,25 @@ def test_jop_set_regs_end_to_end(jop_rop_full):
         assert g.has_endbr and g.is_functional(chain.R, chain.dispatch_reg)
 
 
+def test_jop_negative_stride_table_within_reserved(jop_rop_full):
+    # a sub-based dispatcher has a negative stride; the table grows downward, so the
+    # reserved region must cover the entries (regression: the base wasn't offset, so
+    # entries landed below table_ptr, outside the reserved/zeroed window)
+    from angrop.chain_builder.builder import Builder
+
+    js = jop_rop_full.chain_builder._jop_setter
+    bytes_per = jop_rop_full.project.arch.bytes
+    for n, stride in ((3, 8), (3, -8)):
+        before = list(Builder.used_writable_ptrs)
+        tp = js._alloc_table_ptr(n, stride)
+        new = [x for x in Builder.used_writable_ptrs if x not in before]
+        assert len(new) == 1
+        base, span = new[0]
+        for k in range(n):  # every entry must fit inside the reserved [base, base+span)
+            entry = tp + k * stride
+            assert base <= entry and entry + bytes_per <= base + span
+
+
 def test_jop_chain_fails_closed_on_stack_apis(jop_rop):
     from angrop.jop_chain import JopChain
 

@@ -192,20 +192,22 @@ class ROP(Analysis):
         all_gadgets = self._all_gadgets
         for g in all_gadgets:
             g.project = None
-        # record whether dispatcher classification ran at find time (it's gated on
-        # shstk and needs the analysis states, so it can't be redone on load)
-        return (all_gadgets, self._duplicates, self.arch.shstk)
+        # record whether dispatcher classification ran at find time -- gated on
+        # cet_forced (NOT shstk), so the load-time check below is consistent with where
+        # tags are actually produced. Tags need the analysis states, so can't be redone
+        # on load.
+        return (all_gadgets, self._duplicates, self.arch.cet_forced)
 
     def _load_cache_tuple(self, tup):
         self._all_gadgets = tup[0]
         self._duplicates = tup[1]
-        # dispatcher tags (is_dispatcher/dispatch_*) are only produced under shstk and
-        # cannot be recomputed on load (they need the analysis states). A cache built
-        # without CET therefore carries no dispatcher tags. Legacy ROP still works on
-        # such a load (has_endbr is recomputed below), so only warn -- the hard failure
-        # belongs in the JOP orchestrator's "no viable dispatcher" path, not here. (C3)
-        cached_shstk = tup[2] if len(tup) > 2 else False
-        if self.arch.shstk and not cached_shstk:
+        # dispatcher tags (is_dispatcher/dispatch_*) are only produced when CET is opted
+        # into (cet_forced) and cannot be recomputed on load (they need the analysis
+        # states). Loading a cache built without cet=True under cet=True therefore has no
+        # dispatcher tags; legacy ROP still works (has_endbr is recomputed below), so only
+        # warn -- the hard failure belongs in the JOP orchestrator, not here. (C3)
+        cached_cet = tup[2] if len(tup) > 2 else False
+        if self.arch.cet_forced and not cached_cet:
             l.warning("gadget cache was built without CET/shadow-stack; it has no JOP "
                       "dispatcher tags. Legacy ROP is unaffected, but JOP chain building "
                       "will find no dispatcher -- re-run find_gadgets() to repopulate.")

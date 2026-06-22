@@ -58,9 +58,22 @@ class JopSetter(Builder):
             if not g.is_functional(r, rd):
                 continue
             if any(reg in g.popped_regs or reg in g.changed_regs or reg in g.concrete_regs
-                   for reg in target_regs):
+                   or reg in g.reg_dependencies for reg in target_regs):
                 pool.append(g)
         return pool
+
+    def _alloc_table_ptr(self, n, stride):
+        """
+        Reserve a badbyte-free region for an n-entry dispatch table at `stride` and return
+        the address of table[0]. Entries are staged at table_ptr + k*stride (k=0..n-1); for
+        a negative stride (a `sub Rd,s` dispatcher) the table grows downward, so table[0]
+        sits at the HIGH end of the reserved region (otherwise the entries would land below
+        table_ptr, outside the reserved/zeroed window).
+        """
+        bytes_per = self.project.arch.bytes
+        span = (n - 1) * abs(stride) + bytes_per
+        base = self._get_ptr_to_writable(span)
+        return base if stride > 0 else base + (n - 1) * abs(stride)
 
     def run(self, modifiable_memory_range=None, preserve_regs=None, warn=True, **registers): # pylint: disable=unused-argument
         return self.set_regs(preserve_regs=preserve_regs, **registers)
@@ -82,23 +95,27 @@ class JopSetter(Builder):
                 continue
             accept = lambda g, _r=r, _rd=rd: g.is_functional(_r, _rd)
             try:
+                # handle_hard=False: hard-reg handling consults the legacy self_contained
+                # _reg_setting_dict, which never holds functional gadgets (would misfire)
                 seqs = rs.find_candidate_chains_giga_graph_search(
-                    None, dict(rop_regs), preserve_regs, False, gadgets=pool, accept=accept)
+                    None, dict(rop_regs), preserve_regs, False,
+                    gadgets=pool, accept=accept, handle_hard=False)
             except RopException:
                 continue
             for seq in seqs:
                 if not seq:
                     continue
-                # the table is an attacker-staged precondition; just need a badbyte-free
-                # address with room for the entries at stride
-                size = (len(seq) + 1) * abs(d.dispatch_stride)
+                used_before = list(Builder.used_writable_ptrs)
                 try:
-                    table_ptr = self._get_ptr_to_writable(size)
+                    table_ptr = self._alloc_table_ptr(len(seq), d.dispatch_stride)
                     chain = self._build_jop_chain(list(seq), d, r, table_ptr, dict(rop_regs))
                     if self._verify(chain, rop_regs):
                         return chain
                 except RopException:
-                    continue
+                    pass
+                # release any writable region this failed attempt reserved (a successful
+                # attempt returns above and keeps its table reservation)
+                Builder.used_writable_ptrs[:] = used_before
         raise RopException("JOP: couldn't set registers with the available "
                            "dispatcher/functional gadgets")
 
