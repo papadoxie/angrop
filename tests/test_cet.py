@@ -350,14 +350,22 @@ def test_dispatcher_rejects_jmp_reg(jop_rop):
     assert g is not None and g.is_dispatcher is False
 
 
-def test_dispatcher_tagging_gated_on_shstk(jop_bin):
-    # with CET forced off, the dispatcher must NOT be tagged (classification is
-    # gated on shstk so legacy/non-CET discovery is untouched)
+def test_dispatcher_tagging_gated_on_cet_forced(jop_bin):
+    # JOP classification/routing is gated on cet_forced (cet=True opt-in), NOT on
+    # auto-detected shstk -- a binary merely being CET-compiled must stay legacy so
+    # ROP-building on CET binaries is unaffected (C0). jop_bin HAS the CET note.
     proj = angr.Project(jop_bin, auto_load_libs=False)
-    rop = proj.analyses.ROP(cet=False)
-    g = _g(rop, "g_disp")
-    assert g is not None and g.transit_type == "jmp_mem"
-    assert g.is_dispatcher is False
+
+    # cet=False: forced off -> not tagged
+    rop_off = proj.analyses.ROP(cet=False)
+    assert _g(rop_off, "g_disp").is_dispatcher is False
+    assert rop_off.arch.cet_forced is False
+
+    # cet=None on a CET binary: shstk is DETECTED but NOT forced -> still legacy,
+    # dispatcher not tagged (this is the regression guard for the C9 routing gate)
+    rop_auto = angr.Project(jop_bin, auto_load_libs=False).analyses.ROP(cet=None)
+    assert rop_auto.shstk is True and rop_auto.arch.cet_forced is False
+    assert _g(rop_auto, "g_disp").is_dispatcher is False
 
 
 def test_cache_built_without_cet_warns_not_raises(jop_bin, tmp_path, caplog):

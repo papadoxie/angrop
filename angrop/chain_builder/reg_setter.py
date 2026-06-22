@@ -756,10 +756,12 @@ class RegSetter(Builder):
 
     #### Main Entrance ####
     def run(self, modifiable_memory_range=None, preserve_regs=None, warn=True, **registers):
-        # under a shadow stack, a stack/ret chain would fault on its first `ret`; route
-        # to the ret-free JOP orchestrator instead (C9). Clean top-level branch: when
-        # arch.shstk is False this method is byte-identical to before.
-        if self.arch.shstk:
+        # when the user opts into CET (cet=True), a stack/ret chain would fault on its
+        # first `ret` under the shadow stack, so route to the ret-free JOP orchestrator
+        # instead (C9). Gated on cet_forced, NOT auto-detected shstk: a binary merely
+        # being CET-compiled must not silently switch ROP-building to JOP. When
+        # cet_forced is False this method is byte-identical to before (C0).
+        if self.arch.cet_forced:
             return self.chain_builder._jop_setter.set_regs(preserve_regs=preserve_regs, **registers)
 
         if len(registers) == 0:
