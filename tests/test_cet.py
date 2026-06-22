@@ -73,7 +73,13 @@ def nocet_bin(tmp_path_factory):
     if not shutil.which("gcc"):
         pytest.skip("gcc not available")
     out = str(tmp_path_factory.mktemp("nocet") / "nocet")
-    return _build("nocet.c", out, ["-fcf-protection=none", "-O1", "-no-pie"])
+    # only force CET off when the toolchain knows the flag (needed on hardened
+    # distros that default to -fcf-protection=full); otherwise plain gcc is already
+    # non-CET, so we can still build the fixture instead of skipping the C0/C1 tests.
+    flags = ["-O1", "-no-pie"]
+    if _gcc_supports_cf_protection():
+        flags = ["-fcf-protection=none", *flags]
+    return _build("nocet.c", out, flags)
 
 
 def _arch(path):
@@ -222,7 +228,10 @@ def test_stale_cache_retagged_on_load(cet_bin):
     g.has_endbr = False
     g.project = None
 
-    rop2 = proj.analyses.ROP(cet=True)
+    # load through a FRESH project/analysis, mirroring real load_gadgets usage in a
+    # new process (avoids angr's per-project analysis cache returning `rop` again)
+    proj2 = angr.Project(cet_bin, auto_load_libs=False)
+    rop2 = proj2.analyses.ROP(cet=True)
     rop2._load_cache_tuple(([g], {}))
     assert g.has_endbr is True, "load must re-tag has_endbr from the binary"
 
