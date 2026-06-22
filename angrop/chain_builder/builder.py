@@ -358,7 +358,6 @@ class Builder:
         assert lhs.length == rhs.length
         return lhs, rhs
 
-    @rop_utils.timeout(3)
     def _apply_target_constraints(self, state, register_dict, map_stack_var, constrained_addrs):
         """
         The transit-agnostic *solving core*: constrain the final symbolic `state` to the
@@ -414,6 +413,7 @@ class Builder:
                         ropvalue._value = rhs
                     map_stack_var(lhs, ropvalue)
 
+    @rop_utils.timeout(3)
     def _build_reg_setting_chain(
         self, gadgets, register_dict, constrained_addrs=None):
         """
@@ -573,6 +573,7 @@ class Builder:
 
         return chain
 
+    @rop_utils.timeout(3)
     def _build_jop_chain(self, functional_gadgets, dispatcher, R, table_ptr,
                          register_dict, constrained_addrs=None):
         """
