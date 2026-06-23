@@ -345,7 +345,9 @@ class GadgetFinder:
         timeout1 = timeout/2 if timeout is not None else None
         tasks, remaining = self._multiprocess_static_analysis(processes, show_progress, timeout1)
         timeout = remaining+timeout/2 if timeout is not None else None
-        return self._analyze_gadgets_multiprocess(processes, tasks, show_progress, timeout, None), self.get_duplicates()
+        gadgets = self._analyze_gadgets_multiprocess(processes, tasks, show_progress, timeout, None)
+        gadgets = self._supplement_endbr_gadgets(gadgets)
+        return gadgets, self.get_duplicates()
 
     def find_gadgets_single_threaded(self, show_progress=True):
         gadgets = []
@@ -362,10 +364,57 @@ class GadgetFinder:
                 continue
             gadgets.append(res)
 
+        gadgets = self._supplement_endbr_gadgets(gadgets)
         for g in gadgets:
             g.project = self.project
 
         return sorted(gadgets, key=lambda x: x.addr), self.get_duplicates()
+
+    def _endbr_locations(self):
+        """
+        Every endbr-prefixed address in executable memory -- the candidate JOP table
+        entries. The generic discovery heuristics can blacklist a real endbr entry whose
+        address coincides with a mid-instruction boundary of an earlier *garbage* decode
+        that ends in an invalid jump target (skip_addrs), so under cet_forced we scan for
+        endbr directly to make sure no JOP table-entry candidate is missed.
+        """
+        endbr = self.arch.endbr_bytes
+        if not endbr:
+            return
+        for seg in self.project.loader.main_object.segments:
+            if not seg.is_executable:
+                continue
+            try:
+                data = bytes(self.project.loader.memory.load(seg.vaddr, seg.memsize))
+            except KeyError:
+                continue
+            start = 0
+            while True:
+                i = data.find(endbr, start)
+                if i < 0:
+                    break
+                yield seg.vaddr + i
+                start = i + 1
+
+    def _supplement_endbr_gadgets(self, gadgets):
+        """Under an opted-into CET, force-analyze every endbr entry not already found, so
+        JOP table-entry gadgets (e.g. functional stores) the heuristics skip are recovered.
+        No-op when cet is not forced, so legacy discovery is unchanged (C0)."""
+        if not self.arch.cet_forced:
+            return gadgets
+        found = {g.addr for g in gadgets}
+        for addr in self._endbr_locations():
+            if addr in found:
+                continue
+            res = self.gadget_analyzer.analyze_gadget(addr)
+            if res is None:
+                continue
+            if isinstance(res, list):
+                gadgets.extend(res)
+            else:
+                gadgets.append(res)
+            found.add(addr)
+        return gadgets
 
     #### generate addresses from slices ####
     @staticmethod

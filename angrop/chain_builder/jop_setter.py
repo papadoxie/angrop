@@ -2,6 +2,7 @@ import logging
 
 from .builder import Builder
 from ..errors import RopException
+from ..rop_value import RopValue
 from .. import rop_utils
 
 l = logging.getLogger(__name__)
@@ -78,48 +79,117 @@ class JopSetter(Builder):
     def run(self, modifiable_memory_range=None, preserve_regs=None, warn=True, **registers): # pylint: disable=unused-argument
         return self.set_regs(preserve_regs=preserve_regs, **registers)
 
-    def set_regs(self, preserve_regs=None, **registers):
-        if not registers:
-            from ..rop_chain import RopChain # pylint: disable=import-outside-toplevel
-            return RopChain(self.project, self.chain_builder, badbytes=self.badbytes)
-
+    def _build_for(self, reg_targets, terminals=(), preserve_regs=None, verify_fn=None):
+        """
+        Core JOP builder shared by the data-plane primitives. For each (D, R) best-first:
+        set `reg_targets` via the giga-graph search over the functional pool, append the
+        `terminals` (functional gadgets that perform the primitive's operation -- e.g. a
+        store or a non-terminal syscall; each must be is_functional(R, Rd) so it returns
+        to D), build a JopChain, and accept it if `verify_fn(chain)` confirms the goal
+        (default: the requested registers hold their values).
+        """
         preserve_regs = set(preserve_regs) if preserve_regs else set()
-        rop_regs = {r: rop_utils.cast_rop_value(v, self.project) for r, v in registers.items()}
-        target_regs = set(registers)
+        rop_regs = {r: rop_utils.cast_rop_value(v, self.project) for r, v in reg_targets.items()}
+        target_regs = set(reg_targets)
+        terminals = list(terminals)
+        if verify_fn is None:
+            verify_fn = lambda chain: self._verify_regs(chain, rop_regs)
         rs = self.chain_builder._reg_setter
 
         for d, r in self._candidate_dr():
             rd = d.dispatch_reg
-            pool = self._functional_pool(r, rd, target_regs)
-            if not pool:
+            # can't set the dispatch machinery regs, and every terminal must transfer via
+            # `jmp R` (functional) for this (D, R)
+            if target_regs & {r, rd}:
                 continue
-            accept = lambda g, _r=r, _rd=rd: g.is_functional(_r, _rd)
+            if not all(t.is_functional(r, rd) for t in terminals):
+                continue
             try:
-                # handle_hard=False: hard-reg handling consults the legacy self_contained
-                # _reg_setting_dict, which never holds functional gadgets (would misfire)
-                seqs = rs.find_candidate_chains_giga_graph_search(
-                    None, dict(rop_regs), preserve_regs, False,
-                    gadgets=pool, accept=accept, handle_hard=False)
+                if target_regs:
+                    pool = self._functional_pool(r, rd, target_regs)
+                    if not pool:
+                        continue
+                    accept = lambda g, _r=r, _rd=rd: g.is_functional(_r, _rd)
+                    # handle_hard=False: hard-reg handling consults the legacy
+                    # self_contained _reg_setting_dict, which never holds functional gadgets
+                    seqs = rs.find_candidate_chains_giga_graph_search(
+                        None, dict(rop_regs), preserve_regs, False,
+                        gadgets=pool, accept=accept, handle_hard=False)
+                else:
+                    seqs = [[]]
             except RopException:
                 continue
             for seq in seqs:
-                if not seq:
+                full = list(seq) + terminals
+                if not full:
                     continue
                 used_before = list(Builder.used_writable_ptrs)
                 try:
-                    table_ptr = self._alloc_table_ptr(len(seq), d.dispatch_stride)
-                    chain = self._build_jop_chain(list(seq), d, r, table_ptr, dict(rop_regs))
-                    if self._verify(chain, rop_regs):
+                    table_ptr = self._alloc_table_ptr(len(full), d.dispatch_stride)
+                    chain = self._build_jop_chain(full, d, r, table_ptr, dict(rop_regs))
+                    if verify_fn(chain):
                         return chain
                 except RopException:
                     pass
-                # release any writable region this failed attempt reserved (a successful
+                # release the writable region a failed attempt reserved (a successful
                 # attempt returns above and keeps its table reservation)
                 Builder.used_writable_ptrs[:] = used_before
-        raise RopException("JOP: couldn't set registers with the available "
-                           "dispatcher/functional gadgets")
+        raise RopException("JOP: couldn't build the requested primitive with the "
+                           "available dispatcher/functional gadgets")
 
-    def _verify(self, chain, rop_regs):
+    def set_regs(self, preserve_regs=None, **registers):
+        if not registers:
+            from ..rop_chain import RopChain # pylint: disable=import-outside-toplevel
+            return RopChain(self.project, self.chain_builder, badbytes=self.badbytes)
+        return self._build_for(registers, preserve_regs=preserve_regs)
+
+    def write_to_mem(self, addr, data, preserve_regs=None):
+        """
+        Ret-free word-sized memory write via a functional store gadget
+        (`mov [addr_reg], data_reg ; jmp R`): set addr_reg=addr and data_reg=data via the
+        search, then run the store as a (functional) table entry that returns to D.
+        `data` is a single machine word (bytes or int).
+        """
+        arch_bytes = self.project.arch.bytes
+        endian = "little" if self.project.arch.memory_endness == "Iend_LE" else "big"
+        if isinstance(data, bytes):
+            if len(data) > arch_bytes:
+                raise RopException("JOP write_to_mem currently handles word-sized writes")
+            data = int.from_bytes(data.ljust(arch_bytes, b"\x00"), endian)
+        addr_val = addr.concreted if isinstance(addr, RopValue) else int(addr)
+
+        for store in self._functional_stores():
+            mw = store.mem_writes[0]
+            addr_reg = self._single(mw.addr_dependencies)
+            data_reg = self._single(mw.data_dependencies)
+            if addr_reg is None or data_reg is None or addr_reg == data_reg:
+                continue
+            targets = {addr_reg: addr_val, data_reg: data}
+            verify = lambda chain, _a=addr_val, _d=data: self._verify_mem(chain, _a, _d)
+            try:
+                return self._build_for(targets, terminals=[store],
+                                       preserve_regs=preserve_regs, verify_fn=verify)
+            except RopException:
+                continue
+        raise RopException("JOP: couldn't write to memory with the available gadgets")
+
+    @staticmethod
+    def _single(dep_set):
+        deps = set(dep_set)
+        return next(iter(deps)) if len(deps) == 1 else None
+
+    def _functional_stores(self):
+        """functional gadgets that perform exactly one register-addressed memory write."""
+        out = []
+        for g in self.chain_builder.gadgets:
+            if g.transit_type != "jmp_reg" or not g.has_endbr or g.has_conditional_branch:
+                continue
+            if len(g.mem_writes) != 1 or g.mem_reads or g.mem_changes:
+                continue
+            out.append(g)
+        return out
+
+    def _verify_regs(self, chain, rop_regs):
         """exec() the JOP chain and confirm every concrete target register holds its value
         and control ended ret-free back at the dispatcher (C6)."""
         final = chain.exec()
@@ -131,3 +201,12 @@ class JopSetter(Builder):
             if final.solver.eval(final.registers.load(reg)) != val.concreted:
                 return False
         return True
+
+    def _verify_mem(self, chain, addr, data):
+        """exec() the JOP chain and confirm `data` landed at `addr`, ret-free."""
+        final = chain.exec()
+        if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
+            return False
+        word = final.memory.load(addr, self.project.arch.bytes,
+                                 endness=self.project.arch.memory_endness)
+        return final.solver.eval(word) == data

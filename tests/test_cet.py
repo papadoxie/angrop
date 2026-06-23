@@ -587,3 +587,21 @@ def test_jop_chain_fails_closed_on_stack_apis(jop_rop):
         chain.payload_bv()
     with pytest.raises(RopException):
         _ = chain + chain
+
+
+
+def test_jop_write_to_mem_end_to_end(jop_rop_full):
+    # C9 data-plane: under cet=True, rop.write_to_mem routes to the JOP store path -- set
+    # addr/data regs via the search, then a functional store gadget (mov [rdi],rsi; jmp R)
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    addr = 0x500800
+    value = 0xcafebabe11223344
+    chain = rop.write_to_mem(addr, value.to_bytes(8, "little"))
+    assert isinstance(chain, JopChain)
+
+    final = chain.exec()
+    word = final.memory.load(addr, 8, endness=rop.project.arch.memory_endness)
+    assert final.solver.eval(word) == value
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
