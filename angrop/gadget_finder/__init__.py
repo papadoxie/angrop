@@ -347,7 +347,11 @@ class GadgetFinder:
         timeout = remaining+timeout/2 if timeout is not None else None
         gadgets = self._analyze_gadgets_multiprocess(processes, tasks, show_progress, timeout, None)
         gadgets = self._supplement_endbr_gadgets(gadgets)
-        return gadgets, self.get_duplicates()
+        # supplemented gadgets are appended after the workers' results, so (re)attach the
+        # project and re-sort by address to match find_gadgets_single_threaded's output
+        for g in gadgets:
+            g.project = self.project
+        return sorted(gadgets, key=lambda x: x.addr), self.get_duplicates()
 
     def find_gadgets_single_threaded(self, show_progress=True):
         gadgets = []

@@ -152,11 +152,22 @@ class JopSetter(Builder):
         """
         arch_bytes = self.project.arch.bytes
         endian = "little" if self.project.arch.memory_endness == "Iend_LE" else "big"
+        # the cet_forced route is taken before MemWriter's own sanity checks, so validate
+        # here and fail with a clean RopException (not an AssertionError) on bad input
+        if isinstance(addr, RopValue) and addr.symbolic:
+            raise RopException("cannot write to a symbolic address")
         if isinstance(data, bytes):
             if len(data) > arch_bytes:
-                raise RopException("JOP write_to_mem currently handles word-sized writes")
+                # multi-word writes (e.g. "/bin/sh"+argv) need chunked stores -- a future
+                # increment; for now handle a single machine word and fail clearly otherwise
+                raise RopException("JOP write_to_mem currently handles word-sized writes only")
             data = int.from_bytes(data.ljust(arch_bytes, b"\x00"), endian)
-        addr_val = addr.concreted if isinstance(addr, RopValue) else int(addr)
+        elif not isinstance(data, int):
+            raise RopException("data must be bytes or an int")
+        # preserve the address RopValue (and its PIE rebase relationship); only the
+        # analysis-time absolute is used for the exec-time verify check
+        addr_rv = addr if isinstance(addr, RopValue) else rop_utils.cast_rop_value(addr, self.project)
+        addr_val = addr_rv.concreted
 
         for store in self._functional_stores():
             mw = store.mem_writes[0]
@@ -164,7 +175,7 @@ class JopSetter(Builder):
             data_reg = self._single(mw.data_dependencies)
             if addr_reg is None or data_reg is None or addr_reg == data_reg:
                 continue
-            targets = {addr_reg: addr_val, data_reg: data}
+            targets = {addr_reg: addr_rv, data_reg: data}
             verify = lambda chain, _a=addr_val, _d=data: self._verify_mem(chain, _a, _d)
             try:
                 return self._build_for(targets, terminals=[store],
@@ -185,6 +196,10 @@ class JopSetter(Builder):
             if g.transit_type != "jmp_reg" or not g.has_endbr or g.has_conditional_branch:
                 continue
             if len(g.mem_writes) != 1 or g.mem_reads or g.mem_changes:
+                continue
+            # word-sized stores only -- a sub-word store would leave the upper bytes of
+            # the target word unconstrained, and the full-word verify would pass spuriously
+            if g.mem_writes[0].data_size != self.project.arch.bits:
                 continue
             out.append(g)
         return out

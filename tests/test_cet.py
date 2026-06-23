@@ -605,3 +605,20 @@ def test_jop_write_to_mem_end_to_end(jop_rop_full):
     word = final.memory.load(addr, 8, endness=rop.project.arch.memory_endness)
     assert final.solver.eval(word) == value
     assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+
+
+def test_jop_write_to_mem_rejects_bad_input(jop_rop_full):
+    # the cet_forced route bypasses MemWriter's sanity checks, so JopSetter.write_to_mem
+    # must reject bad input with a clean RopException (not AssertionError)
+    import claripy
+    from angrop.rop_value import RopValue
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    sym_addr = RopValue(claripy.BVS("a", rop.project.arch.bits), rop.project)
+    with pytest.raises(RopException):
+        js.write_to_mem(sym_addr, b"\x00" * 8)          # symbolic address
+    with pytest.raises(RopException):
+        js.write_to_mem(0x500000, b"A" * 16)            # multi-word data (not yet supported)
+    with pytest.raises(RopException):
+        js.write_to_mem(0x500000, object())             # bad data type
