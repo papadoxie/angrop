@@ -153,8 +153,12 @@ class JopSetter(Builder):
         arch_bytes = self.project.arch.bytes
         endian = "little" if self.project.arch.memory_endness == "Iend_LE" else "big"
         # the cet_forced route is taken before MemWriter's own sanity checks, so validate
-        # here and fail with a clean RopException (not an AssertionError) on bad input
-        if isinstance(addr, RopValue) and addr.symbolic:
+        # here and fail with a clean RopException (not an AssertionError) on bad input.
+        # preserve the address RopValue (and its PIE rebase relationship); cast first so a
+        # bare symbolic AST is wrapped and the symbolic guard catches it too, not just a
+        # pre-wrapped RopValue. Only the analysis-time absolute is used for the exec verify.
+        addr_rv = addr if isinstance(addr, RopValue) else rop_utils.cast_rop_value(addr, self.project)
+        if addr_rv.symbolic:
             raise RopException("cannot write to a symbolic address")
         if isinstance(data, bytes):
             if len(data) > arch_bytes:
@@ -164,9 +168,6 @@ class JopSetter(Builder):
             data = int.from_bytes(data.ljust(arch_bytes, b"\x00"), endian)
         elif not isinstance(data, int):
             raise RopException("data must be bytes or an int")
-        # preserve the address RopValue (and its PIE rebase relationship); only the
-        # analysis-time absolute is used for the exec-time verify check
-        addr_rv = addr if isinstance(addr, RopValue) else rop_utils.cast_rop_value(addr, self.project)
         addr_val = addr_rv.concreted
 
         for store in self._functional_stores():
