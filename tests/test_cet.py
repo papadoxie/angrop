@@ -269,26 +269,31 @@ def builder(nocet_bin):
 
 def test_check_ibt_noop_when_off(builder):
     rop, b = builder
-    rop.arch.ibt = False
-    # even a violating pair must be a no-op when IBT is off (C0)
-    b._check_ibt([_mk_gadget(0x1, "jmp_reg", False),
-                  _mk_gadget(0x2, "pop_pc", False)])
+    rop.arch.cet_forced = False
+    # even a violating pair must be a no-op when CET is not opted into (C0): a binary
+    # merely being IBT-compiled must not change legacy chain building
+    rop.arch.ibt = True
+    try:
+        b._check_ibt([_mk_gadget(0x1, "jmp_reg", False),
+                      _mk_gadget(0x2, "pop_pc", False)])
+    finally:
+        rop.arch.ibt = False
 
 
 def test_check_ibt_violation_raises(builder):
     rop, b = builder
-    rop.arch.ibt = True
+    rop.arch.cet_forced = True  # opt-in (cet=True); cet_forced implies arch.ibt
     try:
         with pytest.raises(RopException):
             b._check_ibt([_mk_gadget(0x1, "jmp_reg", False),
                           _mk_gadget(0x2, "pop_pc", False)])
     finally:
-        rop.arch.ibt = False
+        rop.arch.cet_forced = False
 
 
 def test_check_ibt_pass(builder):
     rop, b = builder
-    rop.arch.ibt = True
+    rop.arch.cet_forced = True
     try:
         # jmp_reg -> endbr target is legal
         b._check_ibt([_mk_gadget(0x1, "jmp_reg", True),
@@ -297,7 +302,7 @@ def test_check_ibt_pass(builder):
         b._check_ibt([_mk_gadget(0x1, "pop_pc", False),
                       _mk_gadget(0x2, "pop_pc", False)])
     finally:
-        rop.arch.ibt = False
+        rop.arch.cet_forced = False
 
 
 # --------------------------------------------------------------------------- #
@@ -622,3 +627,77 @@ def test_jop_write_to_mem_rejects_bad_input(jop_rop_full):
         js.write_to_mem(0x500000, b"A" * 16)            # multi-word data (not yet supported)
     with pytest.raises(RopException):
         js.write_to_mem(0x500000, object())             # bad data type
+
+
+def test_jop_set_regs_rejects_bad_value_type(jop_rop_full):
+    # a non-(int/str/BV) value must surface as a clean RopException at the public
+    # boundary, not a bare ValueError leaking from cast_rop_value
+    with pytest.raises(RopException):
+        jop_rop_full.set_regs(rdi=object())
+
+
+def test_jop_set_regs_symbolic_target(jop_rop_full):
+    # a symbolic (attacker-controllable) target must build and verify: _verify_regs
+    # confirms the chain leaves the register controllable rather than silently accepting
+    import claripy
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    chain = rop.set_regs(rdi=claripy.BVS("ctrl", rop.project.arch.bits))
+    assert isinstance(chain, JopChain)
+    # the requested register is still symbolic (controllable) after exec
+    assert chain.exec().registers.load("rdi").symbolic
+
+
+def test_jop_set_regs_rejects_unavoidable_badbyte(jop_rop_full):
+    # the JOP path must enforce badbytes on pop-data like the legacy path. rdi=0x41..41
+    # is known-buildable (see test_jop_set_regs_end_to_end), so with 0x41 a badbyte every
+    # pop byte is forced to a badbyte -> no chain can avoid it -> clean RopException.
+    rop = jop_rop_full
+    saved = rop.chain_builder.badbytes
+    rop.chain_builder.badbytes = [0x41]  # set directly: avoid set_badbytes' gadget re-screen
+    try:
+        with pytest.raises(RopException):
+            rop.set_regs(rdi=0x4141414141414141)
+    finally:
+        rop.chain_builder.badbytes = saved
+
+
+def test_jop_set_regs_avoids_badbyte_in_pop_data(jop_rop_full):
+    # with a badbyte that no required value forces, the chain still builds AND every
+    # pop-data word the solver chose is badbyte-free (regression: the JOP path used to
+    # skip badbyte enforcement entirely)
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    bad = 0xff
+    saved = rop.chain_builder.badbytes
+    rop.chain_builder.badbytes = [bad]
+    try:
+        chain = rop.set_regs(rdi=0x1122334455667788)
+        assert isinstance(chain, JopChain)
+        assert chain.exec().solver.eval(chain.exec().regs.rdi) == 0x1122334455667788
+        # every emitted pop-data word, solved under the chain constraints, avoids the badbyte
+        for v in chain._values:
+            word = chain._blank_state.solver.eval(v.data)
+            assert bad not in word.to_bytes(rop.project.arch.bytes, "little")
+    finally:
+        rop.chain_builder.badbytes = saved
+
+
+def test_jop_set_regs_honors_roparg_filler(jop_rop_full):
+    # roparg_filler must be honored on the JOP path: solver-free pop slots take the filler
+    # byte pattern when satisfiable (regression: the JOP path ignored roparg_filler)
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    filler = 0x6161616161616161
+    saved = rop.chain_builder.roparg_filler
+    rop.chain_builder.roparg_filler = filler
+    try:
+        chain = rop.set_regs(rdi=0x1122334455667788)
+        assert isinstance(chain, JopChain)
+        # the requested register still lands; filler only fills otherwise-free slots
+        assert chain.exec().solver.eval(chain.exec().regs.rdi) == 0x1122334455667788
+    finally:
+        rop.chain_builder.roparg_filler = saved

@@ -422,7 +422,7 @@ class Builder:
         This is done by stepping a symbolic state through each gadget
         then constraining the final registers to the values that were requested
         """
-        # legacy/ROP-path IBT enforcement (C7); inert unless arch.ibt is set
+        # legacy/ROP-path IBT enforcement (C7); opt-in, inert unless cet=True (cet_forced)
         self._check_ibt(gadgets)
 
         total_sc = sum(max(g.stack_change, g.max_stack_offset + self.project.arch.bytes) for g in gadgets)
@@ -659,6 +659,15 @@ class Builder:
         self._apply_target_constraints(state, register_dict, map_stack_var, constrained_addrs)
         test_symbolic_state.solver.add(*state.solver.constraints)
 
+        # honor roparg_filler for solver-free pop slots, exactly like the legacy path.
+        # A JopChain disables the payload-time concretization path, so apply this at build
+        # time (the constraints flow into _blank_state, which exec()/dstr() resolve against).
+        if self.roparg_filler is not None:
+            for offset in range(0, total_sc, arch_bytes):
+                sym_word = test_symbolic_state.stack_read(offset, arch_bytes)
+                if test_symbolic_state.solver.satisfiable([sym_word == self.roparg_filler]):
+                    test_symbolic_state.add_constraints(sym_word == self.roparg_filler)
+
         # ----- extract a JopChain: pop-data _values + table_addrs precondition -----
         chain = JopChain(project, self, D, R, table_ptr,
                          [g.addr for g in functional_gadgets],
@@ -677,7 +686,32 @@ class Builder:
             else:
                 chain.add_value(sym_word)
         chain.set_gadgets(list(functional_gadgets))
+        # enforce badbytes on the emitted pop-data. The legacy chain does this at payload
+        # time in _concretize_chain_values; JopChain disables that path, so apply the same
+        # per-byte constraints to _blank_state now (exec() stages from it). Raises
+        # "bad chain!" so _build_for falls through to the next (D, R) -- legacy retry semantics.
+        self._enforce_jop_badbytes(chain)
         return chain
+
+    def _enforce_jop_badbytes(self, chain):
+        """
+        Constrain every byte of a JopChain's pop-data to avoid the configured badbytes,
+        mirroring RopChain._concretize_chain_values. Applied to the chain's _blank_state
+        (which exec()/dstr() resolve against) because a JopChain has no payload-time
+        concretization step. Raises RopException("bad chain!") if a value cannot avoid a
+        badbyte, so the caller can try another gadget sequence -- same semantics as legacy.
+        """
+        if not chain.badbytes:
+            return
+        bs = chain._blank_state
+        for value in chain._values:
+            ast = value.data
+            for idx in range(ast.length // 8):
+                b = ast.get_byte(idx)
+                for c in chain.badbytes:
+                    bs.solver.add(b != c)
+                    if not bs.solver.satisfiable():
+                        raise RopException("bad chain!")
 
     def _get_fill_val(self):
         if self.roparg_filler is not None:
@@ -761,12 +795,17 @@ class Builder:
         Legacy/ROP-path IBT enforcement (C7). On an IBT binary, every indirect branch
         (`jmp reg`/`jmp [mem]`) must land on an endbr instruction. In a stack/ret chain
         the real transition after a `jmp_reg`/`jmp_mem` gadget is to the next gadget, so
-        we require that successor to be endbr. No-op unless `arch.ibt` is set.
+        we require that successor to be endbr.
+
+        Opt-in: gated on `cet_forced` (cet=True), NOT auto-detected `arch.ibt`, so a
+        binary merely being IBT-compiled does not silently change legacy chain building
+        (C0). `cet_forced` implies `arch.ibt` (apply_cet), so the check is meaningful
+        whenever it runs.
 
         This is NOT the JOP gate: under JOP the real transitions go through the
         dispatcher (Fi->D, D->Fi+1), which C6.2 checks instead (P6).
         """
-        if not self.arch.ibt:
+        if not self.arch.cet_forced:
             return
         expanded = self._mixins_to_gadgets(gadgets)
         for prev, cur in zip(expanded, expanded[1:]):
@@ -878,9 +917,9 @@ class Builder:
             # step1: find a shifter that clean up the jmp_mem call
             # if final_gadget is passed in, then it is the shifter
             if final_gadget:
-                # the jmp_mem gadget branches indirectly to this gadget; under IBT it
-                # must be an endbr target (C7)
-                if self.arch.ibt and not final_gadget.has_endbr:
+                # the jmp_mem gadget branches indirectly to this gadget; under opted-in
+                # CET (cet_forced => IBT) it must be an endbr target (C7)
+                if self.arch.cet_forced and not final_gadget.has_endbr:
                     return None
                 shifter = final_gadget
             else:
@@ -896,9 +935,9 @@ class Builder:
                 for shifter in shifter_list:
                     if shifter.pc_offset < shift_size:
                         continue
-                    # the jmp_mem gadget branches indirectly to the shifter; under IBT it
-                    # must be an endbr target (C7)
-                    if self.arch.ibt and not shifter.has_endbr:
+                    # the jmp_mem gadget branches indirectly to the shifter; under opted-in
+                    # CET (cet_forced => IBT) it must be an endbr target (C7)
+                    if self.arch.cet_forced and not shifter.has_endbr:
                         continue
                     if not shifter.changed_regs.intersection(post_preserve):
                         break

@@ -89,7 +89,13 @@ class JopSetter(Builder):
         (default: the requested registers hold their values).
         """
         preserve_regs = set(preserve_regs) if preserve_regs else set()
-        rop_regs = {r: rop_utils.cast_rop_value(v, self.project) for r, v in reg_targets.items()}
+        # the cet_forced route bypasses the legacy boundary checks, so a bad value type or
+        # an invalid register-name value would surface as a bare ValueError; normalize to
+        # RopException at this public boundary
+        try:
+            rop_regs = {r: rop_utils.cast_rop_value(v, self.project) for r, v in reg_targets.items()}
+        except ValueError as e:
+            raise RopException(str(e)) from e
         target_regs = set(reg_targets)
         terminals = list(terminals)
         if verify_fn is None:
@@ -212,9 +218,15 @@ class JopSetter(Builder):
         if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
             return False
         for reg, val in rop_regs.items():
+            final_val = final.registers.load(reg)
             if val.symbolic:
+                # a symbolic target asks for the register to remain attacker-controllable;
+                # don't silently accept -- confirm the chain left it controllable (still
+                # symbolic) rather than pinned to a concrete value by the gadgets
+                if not final_val.symbolic:
+                    return False
                 continue
-            if final.solver.eval(final.registers.load(reg)) != val.concreted:
+            if final.solver.eval(final_val) != val.concreted:
                 return False
         return True
 

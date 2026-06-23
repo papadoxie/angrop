@@ -99,7 +99,10 @@ class FunctionalBlock(RopChain, RopEffect):
 
         project = builder.project
         bytes_per_pop = project.arch.bytes
-        sc = max(gadget.stack_change, 0)
+        # size the symbolic stack like _build_jop_chain: include out-of-patch reads
+        # (max_stack_offset), not just what the gadget pops, so a gadget that reads deeper
+        # than it pops still lands on symbolic stack and re-derives correct effects
+        sc = max(gadget.stack_change, gadget.max_stack_offset + bytes_per_pop, 0)
         state = rop_utils.make_symbolic_state(project, builder.arch.reg_list,
                                               sc // bytes_per_pop)
         state.ip = gadget.addr
@@ -259,7 +262,12 @@ class JopChain(RopChain):
                 lines.append(f"#   [{addr:#x}] = {data!r}")
         lines.append("# stack pop-data:")
         for v in self._values:
-            lines.append(f"#   {v.ast}" if v.symbolic else f"#   {v.concreted:#x}")
+            if v.symbolic:
+                # solve under the chain constraints (which include badbyte avoidance) so
+                # the displayed pop-data is the concrete, badbyte-free bytes to stage
+                lines.append(f"#   {self._blank_state.solver.eval(v.data):#x}")
+            else:
+                lines.append(f"#   {v.concreted:#x}")
         return "\n".join(lines) + "\n"
 
     def payload_code(self, *args, **kwargs): # pylint: disable=arguments-differ
