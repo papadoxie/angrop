@@ -79,14 +79,18 @@ class JopSetter(Builder):
     def run(self, modifiable_memory_range=None, preserve_regs=None, warn=True, **registers): # pylint: disable=unused-argument
         return self.set_regs(preserve_regs=preserve_regs, **registers)
 
-    def _build_for(self, reg_targets, terminals=(), preserve_regs=None, verify_fn=None):
+    def _build_for(self, reg_targets, terminals=(), preserve_regs=None, verify_fn=None,
+                   terminal=False):
         """
         Core JOP builder shared by the data-plane primitives. For each (D, R) best-first:
         set `reg_targets` via the giga-graph search over the functional pool, append the
-        `terminals` (functional gadgets that perform the primitive's operation -- e.g. a
-        store or a non-terminal syscall; each must be is_functional(R, Rd) so it returns
-        to D), build a JopChain, and accept it if `verify_fn(chain)` confirms the goal
+        `terminals` (gadgets that perform the primitive's operation -- e.g. a store or a
+        syscall), build a JopChain, and accept it if `verify_fn(chain)` confirms the goal
         (default: the requested registers hold their values).
+
+        `terminal=True` marks the last terminal as a stop-at-entry gadget (a syscall) that
+        does not return to D: register targets are read right before it runs, and the
+        terminal only needs to be a valid table entry (endbr), not is_functional(R, Rd).
         """
         preserve_regs = set(preserve_regs) if preserve_regs else set()
         # the cet_forced route bypasses the legacy boundary checks, so a bad value type or
@@ -104,11 +108,15 @@ class JopSetter(Builder):
 
         for d, r in self._candidate_dr():
             rd = d.dispatch_reg
-            # can't set the dispatch machinery regs, and every terminal must transfer via
-            # `jmp R` (functional) for this (D, R)
             if target_regs & {r, rd}:
                 continue
-            if not all(t.is_functional(r, rd) for t in terminals):
+            # a normal terminal transfers via `jmp R` (functional) for this (D, R); a
+            # `terminal` one (syscall) is only ever reached -- stop at its endbr entry --
+            # so it just has to be a valid table entry, not return to D.
+            if terminal:
+                if not all(t.has_endbr for t in terminals):
+                    continue
+            elif not all(t.is_functional(r, rd) for t in terminals):
                 continue
             try:
                 if target_regs:
@@ -132,7 +140,8 @@ class JopSetter(Builder):
                 used_before = list(Builder.used_writable_ptrs)
                 try:
                     table_ptr = self._alloc_table_ptr(len(full), d.dispatch_stride)
-                    chain = self._build_jop_chain(full, d, r, table_ptr, dict(rop_regs))
+                    chain = self._build_jop_chain(full, d, r, table_ptr, dict(rop_regs),
+                                                  terminal=terminal)
                     if verify_fn(chain):
                         return chain
                 except RopException:
@@ -205,6 +214,71 @@ class JopSetter(Builder):
                 continue
         raise RopException("JOP: couldn't write to memory with the available gadgets")
 
+    def _syscall_gadgets(self):
+        """endbr syscall gadgets usable as a terminal JOP table entry (the dispatcher can
+        only branch to an endbr address). Sourced from the syscall pool, not the general
+        gadget pool (the analyzer keeps SyscallGadgets separately)."""
+        return [g for g in (self.chain_builder.syscall_gadgets or []) if g.has_endbr]
+
+    def do_syscall(self, syscall_num, args, needs_return=False, preserve_regs=None):
+        """
+        Ret-free syscall (C9). Set the syscall-number register + the argument registers via
+        the search, then dispatch to a syscall gadget as a TERMINAL table entry: stepping
+        stops at its endbr entry, with the registers set right before `syscall` runs (the
+        syscall clobbers rax, so they can't be checked afterwards). `args` are register
+        values (immediates/addresses); staging argument data into memory is a separate
+        primitive. `needs_return` is accepted for signature parity but a JOP syscall does
+        not model post-syscall continuation (execve replaces the process anyway).
+        """
+        import angr # pylint: disable=import-outside-toplevel
+        if needs_return:
+            # continuation after the syscall would need a functional (returns-to-D) syscall
+            # gadget plus mid-chain reg constraints (the syscall clobbers rax) -- a later
+            # increment. The terminal model stops at the syscall, so only needs_return=False.
+            raise RopException("JOP do_syscall: needs_return=True is not yet supported "
+                               "(continuation after a ret-free syscall); pass needs_return=False")
+        cc = angr.SYSCALL_CC[self.project.arch.name]["default"](self.project.arch)
+        if len(args) > len(cc.ARG_REGS):
+            raise RopException("JOP do_syscall: stack syscall arguments are not supported")
+        sysnum_reg = self.project.arch.register_names[self.project.arch.syscall_num_offset]
+        reg_targets = {sysnum_reg: syscall_num}
+        for arg, reg in zip(args, cc.ARG_REGS):
+            reg_targets[reg] = arg
+
+        gadgets = self._syscall_gadgets()
+        if not gadgets:
+            raise RopException("target has no endbr syscall gadget for a ret-free syscall")
+        target_regs = set(reg_targets)
+        for sc in gadgets:
+            # the chain stages the arg/sysnum registers BEFORE dispatching to `sc`, and the
+            # verify stops at sc's entry. If sc's own prologue (its instructions between the
+            # entry and `syscall`) writes one of those target registers, the staged value
+            # would be clobbered before the syscall runs -- the chain would verify-at-entry
+            # but execute the syscall with the wrong register. Skip such a gadget.
+            prologue = getattr(sc, "prologue", None)
+            if prologue is not None and set(prologue.changed_regs) & target_regs:
+                continue
+            try:
+                return self._build_for(reg_targets, terminals=[sc],
+                                       preserve_regs=preserve_regs, terminal=True)
+            except RopException:
+                continue
+        raise RopException("JOP: couldn't invoke the syscall with the available gadgets")
+
+    def execve(self, path=None, path_addr=None):
+        """
+        Ret-free execve (C9). Requires the path string to already be in memory at
+        `path_addr` (e.g. a "/bin/sh" literal in the target); staging the string into
+        memory in the same chain needs the multi-operation builder (a later increment).
+        Invokes execve(path_addr, 0, 0) via a terminal syscall.
+        """
+        if path_addr is None:
+            raise RopException("JOP execve currently requires path_addr (the path string "
+                               "must already be in memory)")
+        ptr = rop_utils.cast_rop_value(0, self.project)
+        return self.do_syscall(self.arch.execve_num, [path_addr, ptr, ptr],
+                               needs_return=False)
+
     @staticmethod
     def _single(dep_set):
         deps = set(dep_set)
@@ -227,9 +301,11 @@ class JopSetter(Builder):
 
     def _verify_regs(self, chain, rop_regs):
         """exec() the JOP chain and confirm every concrete target register holds its value
-        and control ended ret-free back at the dispatcher (C6)."""
+        and control ended where expected -- ret-free back at the dispatcher, or (for a
+        terminal syscall chain) at the syscall gadget's entry, right before it runs (C6)."""
         final = chain.exec()
-        if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
+        expected_ip = chain.table_addrs[-1] if chain.terminal else chain.dispatcher.addr
+        if final.solver.eval(final.regs.ip) != expected_ip:
             return False
         for reg, val in rop_regs.items():
             final_val = final.registers.load(reg)

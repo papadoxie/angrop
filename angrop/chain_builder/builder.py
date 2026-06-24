@@ -575,7 +575,7 @@ class Builder:
 
     @rop_utils.timeout(3)
     def _build_jop_chain(self, functional_gadgets, dispatcher, R, table_ptr,
-                         register_dict, constrained_addrs=None):
+                         register_dict, constrained_addrs=None, terminal=False):
         """
         JOP-mode chain build (C5). Steps a symbolic state concretely through the
         dispatcher and the ordered functional gadgets (control is concrete for a fixed
@@ -639,11 +639,20 @@ class Builder:
         # ----- JOP stepping: concrete flow D->F0->D->...->D, bounded to n gadgets -----
         # control is concrete, so each step yields exactly one successor (C6.6, fail
         # closed on any fork); the flow would otherwise run off the end of the table.
+        # terminal: the last table entry does NOT return to D (a syscall); stop at its
+        # entry so register_dict is constrained right before it runs (the syscall clobbers
+        # rax, so a back-at-D state could not pin the requested sysnum). C9.
+        terminal_addr = functional_gadgets[-1].addr if terminal else None
         simgr = project.factory.simgr(state, save_unconstrained=True)
         returns_to_D = 0
         steps = 0
         budget = 8 * n + 16
-        while returns_to_D < n:
+        while True:
+            if terminal:
+                if state.solver.eval(state.regs.ip) == terminal_addr:
+                    break
+            elif returns_to_D >= n:
+                break
             simgr.step()
             steps += 1
             succs = simgr.active + simgr.unconstrained
@@ -671,7 +680,8 @@ class Builder:
         # ----- extract a JopChain: pop-data _values + table_addrs precondition -----
         chain = JopChain(project, self, D, R, table_ptr,
                          [g.addr for g in functional_gadgets],
-                         state=test_symbolic_state.copy(), badbytes=self.badbytes)
+                         state=test_symbolic_state.copy(), badbytes=self.badbytes,
+                         terminal=terminal)
         if not chain._blank_state.satisfiable():
             raise RopException("the JOP chain is not feasible!")
         for offset in range(0, total_sc, arch_bytes):

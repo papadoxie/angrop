@@ -47,6 +47,12 @@ __asm__(
 "    pop  %rdx\n"
 "    jmp  *%rbx\n"
 ".p2align 4\n"
+".globl g_pop_rax\n"            /* functional: pop rax; jmp rbx (syscall number reg) */
+"g_pop_rax:\n"
+"    endbr64\n"
+"    pop  %rax\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
 ".globl g_store\n"             /* functional store: mov [rdi], rsi; jmp rbx */
 "g_store:\n"
 "    endbr64\n"
@@ -59,6 +65,19 @@ __asm__(
 "    mov  %rsi, 0x10(%rdi)\n"
 "    jmp  *%rbx\n"
 ".p2align 4\n"
+".globl g_syscall\n"           /* syscall table entry: endbr64; syscall; jmp rbx (terminal-stop at entry) */
+"g_syscall:\n"
+"    endbr64\n"
+"    syscall\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
+".globl g_syscall_xor\n"       /* syscall with a prologue that writes rsi (endbr; xor esi,esi; syscall) */
+"g_syscall_xor:\n"
+"    endbr64\n"
+"    xor  %esi, %esi\n"
+"    syscall\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
 ".globl g_clobber\n"            /* NOT a dispatcher: also clobbers rcx (changed_regs not subset {rbp}) */
 "g_clobber:\n"
 "    endbr64\n"
@@ -67,8 +86,10 @@ __asm__(
 "    jmp  *-8(%rbp)\n"
 );
 extern void g_disp(void), g_disp_c0(void), g_disp_sub(void), g_pop_rdi(void),
-            g_pop_rdi_ret(void), g_pop_rsi(void), g_pop_rdx(void), g_store(void),
-            g_store_off(void), g_clobber(void);
+            g_pop_rdi_ret(void), g_pop_rsi(void), g_pop_rdx(void), g_pop_rax(void),
+            g_store(void), g_store_off(void), g_syscall(void), g_syscall_xor(void),
+            g_clobber(void);
 void *keep[] = { g_disp, g_disp_c0, g_disp_sub, g_pop_rdi, g_pop_rdi_ret,
-                 g_pop_rsi, g_pop_rdx, g_store, g_store_off, g_clobber };
+                 g_pop_rsi, g_pop_rdx, g_pop_rax, g_store, g_store_off, g_syscall,
+                 g_syscall_xor, g_clobber };
 int main(){ return (int)(uintptr_t)keep[0]; }

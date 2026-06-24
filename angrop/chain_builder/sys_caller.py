@@ -100,6 +100,10 @@ class SysCaller(FuncCaller):
         raise RopException("Fail to invoke execve!")
 
     def execve(self, path=None, path_addr=None):
+        # under an opted-into CET (cet=True), a stack/ret syscall chain faults; route to
+        # the ret-free JOP path (C9). Byte-identical when off.
+        if self.arch.cet_forced:
+            return self.chain_builder._jop_setter.execve(path=path, path_addr=path_addr)
         if self.project.simos.name != 'Linux':
             raise RopException(f"{self.project.simos.name} is not supported!")
         if not self.syscall_gadgets:
@@ -184,6 +188,11 @@ class SysCaller(FuncCaller):
         :param needs_return: whether to continue the ROP after invoking the syscall
         :return: a RopChain which makes the system with the requested register contents
         """
+        # under an opted-into CET (cet=True), route to the ret-free JOP syscall path (C9)
+        if self.arch.cet_forced:
+            return self.chain_builder._jop_setter.do_syscall(
+                syscall_num, args, needs_return=needs_return,
+                preserve_regs=kwargs.get('preserve_regs'))
         if not self.syscall_gadgets:
             raise RopException("target does not contain syscall gadget!")
 
