@@ -149,21 +149,30 @@ class JopSetter(Builder):
             return RopChain(self.project, self.chain_builder, badbytes=self.badbytes)
         return self._build_for(registers, preserve_regs=preserve_regs)
 
-    def write_to_mem(self, addr, data, preserve_regs=None):
+    def write_to_mem(self, addr, data, preserve_regs=None, fill_byte=b"\xff"):
         """
         Ret-free word-sized memory write via a functional store gadget
         (`mov [addr_reg], data_reg ; jmp R`): set addr_reg=addr and data_reg=data via the
         search, then run the store as a (functional) table entry that returns to D.
-        `data` is a single machine word (bytes or int).
+        `data` is a single machine word (bytes or int); sub-word `data` is padded with
+        `fill_byte` (default 0xff, matching MemWriter -- 0x00 is a common badbyte).
         """
         arch_bytes = self.project.arch.bytes
         endian = "little" if self.project.arch.memory_endness == "Iend_LE" else "big"
         # the cet_forced route is taken before MemWriter's own sanity checks, so validate
-        # here and fail with a clean RopException (not an AssertionError) on bad input.
+        # here and fail with a clean RopException (not an AssertionError/ValueError) on bad
+        # input, mirroring the legacy boundary checks (fill_byte shape + badbyte).
+        if not (isinstance(fill_byte, bytes) and len(fill_byte) == 1):
+            raise RopException("fill_byte is not a one byte string, aborting")
+        if ord(fill_byte) in self.badbytes:
+            raise RopException("fill_byte is a bad byte!")
         # preserve the address RopValue (and its PIE rebase relationship); cast first so a
         # bare symbolic AST is wrapped and the symbolic guard catches it too, not just a
         # pre-wrapped RopValue. Only the analysis-time absolute is used for the exec verify.
-        addr_rv = addr if isinstance(addr, RopValue) else rop_utils.cast_rop_value(addr, self.project)
+        try:
+            addr_rv = addr if isinstance(addr, RopValue) else rop_utils.cast_rop_value(addr, self.project)
+        except ValueError as e:
+            raise RopException(str(e)) from e
         if addr_rv.symbolic:
             raise RopException("cannot write to a symbolic address")
         if isinstance(data, bytes):
@@ -171,7 +180,7 @@ class JopSetter(Builder):
                 # multi-word writes (e.g. "/bin/sh"+argv) need chunked stores -- a future
                 # increment; for now handle a single machine word and fail clearly otherwise
                 raise RopException("JOP write_to_mem currently handles word-sized writes only")
-            data = int.from_bytes(data.ljust(arch_bytes, b"\x00"), endian)
+            data = int.from_bytes(data.ljust(arch_bytes, fill_byte), endian)
         elif not isinstance(data, int):
             raise RopException("data must be bytes or an int")
         addr_val = addr_rv.concreted
@@ -182,7 +191,12 @@ class JopSetter(Builder):
             data_reg = self._single(mw.data_dependencies)
             if addr_reg is None or data_reg is None or addr_reg == data_reg:
                 continue
-            targets = {addr_reg: addr_rv, data_reg: data}
+            # the store writes to [addr_reg + addr_offset]; fold the displacement into the
+            # addr-register target so the write lands at `addr` (PIE rebase preserved via
+            # RopValue arithmetic). _verify_mem still reads `addr`, so a wrong offset just
+            # fails verification and the candidate is dropped -- never a bad chain.
+            addr_target = addr_rv + (-(mw.addr_offset or 0))
+            targets = {addr_reg: addr_target, data_reg: data}
             verify = lambda chain, _a=addr_val, _d=data: self._verify_mem(chain, _a, _d)
             try:
                 return self._build_for(targets, terminals=[store],

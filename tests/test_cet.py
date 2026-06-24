@@ -627,6 +627,36 @@ def test_jop_write_to_mem_rejects_bad_input(jop_rop_full):
         js.write_to_mem(0x500000, b"A" * 16)            # multi-word data (not yet supported)
     with pytest.raises(RopException):
         js.write_to_mem(0x500000, object())             # bad data type
+    with pytest.raises(RopException):
+        js.write_to_mem(object(), b"\x00" * 8)          # bad addr type (must be clean RopException)
+
+
+def test_jop_write_to_mem_pads_with_fill_byte(jop_rop_full):
+    # sub-word data must be padded with fill_byte (default 0xff, matching MemWriter --
+    # 0x00 is a common badbyte); regression: the JOP path hardcoded 0x00 padding
+    rop = jop_rop_full
+    addr = 0x500880
+    chain = rop.write_to_mem(addr, b"AB")               # default fill_byte b"\xff"
+    final = chain.exec()
+    word = final.memory.load(addr, 8, endness=rop.project.arch.memory_endness)
+    assert final.solver.eval(word) == int.from_bytes(b"AB".ljust(8, b"\xff"), "little")
+
+
+def test_jop_write_to_mem_compensates_addr_offset(jop_rop_full, monkeypatch):
+    # an offset store (mov [rdi+0x10], rsi) must still land the write at `addr`: the
+    # displacement is folded into the addr-register target. Force the offset store to be
+    # the only candidate so the compensation path is exercised (g_store has offset 0).
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    off_store = _g(rop, "g_store_off")
+    assert off_store.mem_writes[0].addr_offset == 0x10  # analyzer captured the displacement
+    monkeypatch.setattr(js, "_functional_stores", lambda: [off_store])
+    addr, value = 0x500900, 0xdeadbeef0badf00d
+    chain = js.write_to_mem(addr, value.to_bytes(8, "little"))
+    final = chain.exec()
+    word = final.memory.load(addr, 8, endness=rop.project.arch.memory_endness)
+    assert final.solver.eval(word) == value
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
 
 
 def test_jop_set_regs_rejects_bad_value_type(jop_rop_full):

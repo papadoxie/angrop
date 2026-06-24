@@ -676,7 +676,8 @@ class MemWriter(Builder):
         # under an opted-into CET (cet=True), a stack/ret chain faults; route to the
         # ret-free JOP store path instead (C9). Gated on cet_forced, byte-identical when off.
         if self.arch.cet_forced:
-            return self.chain_builder._jop_setter.write_to_mem(addr, data, preserve_regs=preserve_regs)
+            return self.chain_builder._jop_setter.write_to_mem(
+                addr, data, preserve_regs=preserve_regs, fill_byte=fill_byte)
 
         # sanity check
         if not (isinstance(fill_byte, bytes) and len(fill_byte) == 1):

@@ -53,6 +53,12 @@ __asm__(
 "    mov  %rsi, (%rdi)\n"
 "    jmp  *%rbx\n"
 ".p2align 4\n"
+".globl g_store_off\n"         /* offset store: mov [rdi+0x10], rsi; jmp rbx (addr_offset=0x10) */
+"g_store_off:\n"
+"    endbr64\n"
+"    mov  %rsi, 0x10(%rdi)\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
 ".globl g_clobber\n"            /* NOT a dispatcher: also clobbers rcx (changed_regs not subset {rbp}) */
 "g_clobber:\n"
 "    endbr64\n"
@@ -62,7 +68,7 @@ __asm__(
 );
 extern void g_disp(void), g_disp_c0(void), g_disp_sub(void), g_pop_rdi(void),
             g_pop_rdi_ret(void), g_pop_rsi(void), g_pop_rdx(void), g_store(void),
-            g_clobber(void);
+            g_store_off(void), g_clobber(void);
 void *keep[] = { g_disp, g_disp_c0, g_disp_sub, g_pop_rdi, g_pop_rdi_ret,
-                 g_pop_rsi, g_pop_rdx, g_store, g_clobber };
+                 g_pop_rsi, g_pop_rdx, g_store, g_store_off, g_clobber };
 int main(){ return (int)(uintptr_t)keep[0]; }
