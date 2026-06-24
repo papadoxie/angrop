@@ -659,6 +659,87 @@ def test_jop_write_to_mem_compensates_addr_offset(jop_rop_full, monkeypatch):
     assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
 
 
+def test_jop_do_syscall_sets_args(jop_rop_full):
+    # C9 syscall: set the sysnum + arg registers via pops, then dispatch to a terminal
+    # syscall gadget; exec stops at the syscall gadget's entry with the registers set
+    # right before `syscall` runs (rax not yet clobbered by the return value).
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    chain = js.do_syscall(60, [0xaa, 0xbb, 0xcc])
+    assert isinstance(chain, JopChain) and chain.terminal
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rax) == 60
+    assert final.solver.eval(final.regs.rdi) == 0xaa
+    assert final.solver.eval(final.regs.rsi) == 0xbb
+    assert final.solver.eval(final.regs.rdx) == 0xcc
+    # stopped at the syscall gadget's entry (terminal), not back at the dispatcher
+    assert final.solver.eval(final.regs.rip) == chain.table_addrs[-1]
+
+
+def test_jop_do_syscall_routes_under_cet(jop_rop_full):
+    # cet=True routes the public do_syscall through the JOP path (C9). needs_return=True
+    # (continuation after a ret-free syscall) is an explicit, clean limitation for now.
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    chain = rop.chain_builder.do_syscall(60, [0x1, 0x2, 0x3], needs_return=False)
+    assert isinstance(chain, JopChain) and chain.terminal
+    with pytest.raises(RopException):
+        rop.chain_builder.do_syscall(60, [0x1], needs_return=True)
+
+
+def test_jop_syscall_skips_prologue_clobbering_gadget(jop_rop_full, monkeypatch):
+    # a syscall gadget whose prologue writes a target register (endbr; xor esi,esi; syscall)
+    # must be skipped when rsi is a syscall argument: otherwise the chain verifies at the
+    # gadget entry (rsi=requested) but runs the syscall with rsi clobbered to 0.
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    xor_sc = _g(rop, "g_syscall_xor")
+    assert "rsi" in xor_sc.prologue.changed_regs   # prologue zeroes rsi before the syscall
+    monkeypatch.setattr(js, "_syscall_gadgets", lambda: [xor_sc])
+    # rsi IS an argument (arg1) -> the only gadget is unsafe -> clean failure, not a wrong chain
+    with pytest.raises(RopException):
+        js.do_syscall(60, [0xaa, 0xbb, 0xcc])
+    # rsi is NOT a target (only rdi arg) -> clobbering rsi to 0 is harmless -> still builds
+    chain = js.do_syscall(60, [0xaa])
+    assert isinstance(chain, JopChain)
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rdi) == 0xaa
+    assert final.solver.eval(final.regs.rax) == 60
+
+
+def test_jop_execve_sets_regs(jop_rop_full):
+    # execve(path_addr, 0, 0) via a terminal syscall: rdi=path, rsi=rdx=0, rax=execve_num.
+    # (Requires the path string already in memory; in-chain string staging is a later step.)
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    chain = js.execve(path_addr=0x500000)
+    assert isinstance(chain, JopChain) and chain.terminal
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rdi) == 0x500000
+    assert final.solver.eval(final.regs.rsi) == 0
+    assert final.solver.eval(final.regs.rdx) == 0
+    assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
+
+
+def test_jop_syscall_rejects_bad_input(jop_rop_full):
+    # input guards on the JOP syscall/execve boundary must raise a clean RopException
+    import claripy
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    with pytest.raises(RopException):
+        js.do_syscall(60, 0xaa)                                       # args not a sequence
+    with pytest.raises(RopException):
+        js.execve(path_addr=claripy.BVS("p", rop.project.arch.bits))  # symbolic path_addr
+
+
 def test_jop_set_regs_rejects_bad_value_type(jop_rop_full):
     # a non-(int/str/BV) value must surface as a clean RopException at the public
     # boundary, not a bare ValueError leaking from cast_rop_value

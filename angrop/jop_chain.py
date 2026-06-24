@@ -152,7 +152,7 @@ class JopChain(RopChain):
     """
 
     def __init__(self, project, builder, dispatcher, R, table_ptr, table_addrs,
-                 state=None, badbytes=None):
+                 state=None, badbytes=None, terminal=False):
         super().__init__(project, builder, state=state, badbytes=badbytes)
         self.dispatcher = dispatcher                  # the dispatcher RopGadget D
         self.R = R                                    # return register (holds D.addr)
@@ -161,6 +161,9 @@ class JopChain(RopChain):
         self.dispatch_disp = dispatcher.dispatch_disp # delta
         self.table_ptr = table_ptr                    # where the table is staged
         self.table_addrs = list(table_addrs)          # ordered functional gadget addrs
+        # terminal: the last table entry does NOT return to D (e.g. a syscall); exec stops
+        # at its entry so the requested registers are read right before it runs (C9 syscall)
+        self.terminal = terminal
         self.mem_writes = []                          # chain-written data: (addr, bv)
 
     @property
@@ -202,18 +205,27 @@ class JopChain(RopChain):
         step yields exactly one successor (C6.6, fail-closed on any fork), and stepping
         is explicitly bounded to the n functional gadgets -- it would otherwise run off
         the end of the table.
+
+        For a terminal chain (a syscall) the last table entry does not return to D; stepping
+        stops at its entry, so the returned state holds the registers right before it runs.
         """
         project = self._p
         state = self._stage_state()
         D = self.dispatcher.addr
         n = len(self.table_addrs)
+        terminal_addr = self.table_addrs[-1] if self.terminal else None
 
         simgr = project.factory.simgr(state, save_unconstrained=True)
         returns_to_D = 0          # number of functional gadgets that have returned to D
         steps = 0
         budget = 8 * n + 16       # generous bound for multi-block functional gadgets
         cur = state
-        while returns_to_D < n:
+        while True:
+            if self.terminal:
+                if cur.solver.eval(cur.regs.ip) == terminal_addr:
+                    break
+            elif returns_to_D >= n:
+                break
             simgr.step()
             steps += 1
             succs = simgr.active + simgr.unconstrained
@@ -292,7 +304,7 @@ class JopChain(RopChain):
         # (project, builder) constructor, but JopChain.__init__ needs the dispatcher,
         # R, table_ptr and table_addrs. Construct correctly, then mirror RopChain.copy().
         cp = JopChain(self._p, self._builder, self.dispatcher, self.R, self.table_ptr,
-                      list(self.table_addrs))
+                      list(self.table_addrs), terminal=self.terminal)
         cp._gadgets = list(self._gadgets)
         cp._values = list(self._values)
         cp.payload_len = self.payload_len
