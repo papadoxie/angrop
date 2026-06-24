@@ -544,8 +544,12 @@ class GadgetAnalyzer:
         gadget = self._effect_analysis(gadget, init_state, final_state, ctrl_type, do_cond_branch)
         if gadget is not None:
             # tag IBT-legality of the gadget's entry (C2); gadget entries are
-            # instruction-aligned by construction, so the raw-byte compare is sound
-            gadget.has_endbr = self.arch.addr_has_endbr(addr)
+            # instruction-aligned by construction, so the raw-byte compare is sound.
+            # Only on a CET-relevant binary (IBT/shstk present or forced) -- a pure
+            # non-CET binary leaves has_endbr at its False default and pays no per-gadget
+            # loader cost. Gate mirrors the cache-retag gate in rop.py for consistency.
+            if self.arch.ibt or self.arch.shstk:
+                gadget.has_endbr = self.arch.addr_has_endbr(addr)
             # JOP dispatcher classification (C3); only when CET is opted into (cet=True),
             # so legacy/auto-detect discovery pays zero extra solver cost
             if self.arch.cet_forced:

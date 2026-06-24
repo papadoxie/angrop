@@ -342,10 +342,19 @@ class GadgetFinder:
     def find_gadgets(self, processes=4, show_progress=True, timeout=None):
         assert self.gadget_analyzer is not None
         self._cache = {}
+        deadline = (time.time() + timeout) if timeout is not None else None
         timeout1 = timeout/2 if timeout is not None else None
         tasks, remaining = self._multiprocess_static_analysis(processes, show_progress, timeout1)
         timeout = remaining+timeout/2 if timeout is not None else None
-        return self._analyze_gadgets_multiprocess(processes, tasks, show_progress, timeout, None), self.get_duplicates()
+        gadgets = self._analyze_gadgets_multiprocess(processes, tasks, show_progress, timeout, None)
+        # the supplement runs serially in this process AFTER the budget above; honor the
+        # caller's total timeout so find_gadgets(timeout=N) still returns within ~N seconds
+        gadgets = self._supplement_endbr_gadgets(gadgets, deadline=deadline)
+        # supplemented gadgets are appended after the workers' results, so (re)attach the
+        # project and re-sort by address to match find_gadgets_single_threaded's output
+        for g in gadgets:
+            g.project = self.project
+        return sorted(gadgets, key=lambda x: x.addr), self.get_duplicates()
 
     def find_gadgets_single_threaded(self, show_progress=True):
         gadgets = []
@@ -362,10 +371,66 @@ class GadgetFinder:
                 continue
             gadgets.append(res)
 
+        gadgets = self._supplement_endbr_gadgets(gadgets)
         for g in gadgets:
             g.project = self.project
 
         return sorted(gadgets, key=lambda x: x.addr), self.get_duplicates()
+
+    def _endbr_locations(self):
+        """
+        Every endbr-prefixed address in executable memory -- the candidate JOP table
+        entries. The generic discovery heuristics can blacklist a real endbr entry whose
+        address coincides with a mid-instruction boundary of an earlier *garbage* decode
+        that ends in an invalid jump target (skip_addrs), so under cet_forced we scan for
+        endbr directly to make sure no JOP table-entry candidate is missed.
+        """
+        endbr = self.arch.endbr_bytes
+        if not endbr:
+            return
+        for seg in self.project.loader.main_object.segments:
+            if not seg.is_executable:
+                continue
+            try:
+                data = bytes(self.project.loader.memory.load(seg.vaddr, seg.memsize))
+            except KeyError:
+                continue
+            start = 0
+            while True:
+                i = data.find(endbr, start)
+                if i < 0:
+                    break
+                yield seg.vaddr + i
+                start = i + 1
+
+    def _supplement_endbr_gadgets(self, gadgets, deadline=None):
+        """Under an opted-into CET, force-analyze every endbr entry not already found, so
+        JOP table-entry gadgets (e.g. functional stores) the heuristics skip are recovered.
+        No-op when cet is not forced, so legacy discovery is unchanged (C0).
+
+        `deadline` (an absolute time.time() value) bounds this serial pass to the caller's
+        find_gadgets timeout; remaining endbr candidates are skipped (logged) once past it."""
+        if not self.arch.cet_forced:
+            return gadgets
+        found = {g.addr for g in gadgets}
+        dropped = 0
+        for addr in self._endbr_locations():
+            if addr in found:
+                continue
+            if deadline is not None and time.time() > deadline:
+                dropped += 1
+                continue
+            res = self.gadget_analyzer.analyze_gadget(addr)
+            if res is None:
+                continue
+            if isinstance(res, list):
+                gadgets.extend(res)
+            else:
+                gadgets.append(res)
+            found.add(addr)
+        if dropped:
+            l.info("endbr supplement: skipped %d candidate(s) past the find_gadgets timeout", dropped)
+        return gadgets
 
     #### generate addresses from slices ####
     @staticmethod
