@@ -102,6 +102,10 @@ class JopSetter(Builder):
             raise RopException(str(e)) from e
         target_regs = set(reg_targets)
         terminals = list(terminals)
+        # terminal mode marks the LAST gadget as a stop-at-entry terminal; it must be one of
+        # the `terminals`, never a pop from the search (which would be misclassified)
+        if terminal and not terminals:
+            raise RopException("terminal=True requires a terminal gadget")
         if verify_fn is None:
             verify_fn = lambda chain: self._verify_regs(chain, rop_regs)
         rs = self.chain_builder._reg_setter
@@ -237,6 +241,8 @@ class JopSetter(Builder):
             # increment. The terminal model stops at the syscall, so only needs_return=False.
             raise RopException("JOP do_syscall: needs_return=True is not yet supported "
                                "(continuation after a ret-free syscall); pass needs_return=False")
+        if not isinstance(args, (list, tuple)):
+            raise RopException("JOP do_syscall: args must be a list or tuple of register values")
         cc = angr.SYSCALL_CC[self.project.arch.name]["default"](self.project.arch)
         if len(args) > len(cc.ARG_REGS):
             raise RopException("JOP do_syscall: stack syscall arguments are not supported")
@@ -255,8 +261,11 @@ class JopSetter(Builder):
             # entry and `syscall`) writes one of those target registers, the staged value
             # would be clobbered before the syscall runs -- the chain would verify-at-entry
             # but execute the syscall with the wrong register. Skip such a gadget.
+            # (concrete_regs ⊆ changed_regs in practice, but union both for parity with the
+            # legacy clobber check in case a write escapes changed_regs.)
             prologue = getattr(sc, "prologue", None)
-            if prologue is not None and set(prologue.changed_regs) & target_regs:
+            if prologue is not None and \
+                    (set(prologue.changed_regs) | set(prologue.concrete_regs)) & target_regs:
                 continue
             try:
                 return self._build_for(reg_targets, terminals=[sc],
@@ -275,8 +284,14 @@ class JopSetter(Builder):
         if path_addr is None:
             raise RopException("JOP execve currently requires path_addr (the path string "
                                "must already be in memory)")
+        # the syscall needs a concrete pointer in rdi; reject a symbolic path_addr cleanly
+        # (consistent with write_to_mem) rather than building a chain that merely leaves rdi
+        # controllable
+        path_rv = rop_utils.cast_rop_value(path_addr, self.project)
+        if path_rv.symbolic:
+            raise RopException("JOP execve requires a concrete path_addr")
         ptr = rop_utils.cast_rop_value(0, self.project)
-        return self.do_syscall(self.arch.execve_num, [path_addr, ptr, ptr],
+        return self.do_syscall(self.arch.execve_num, [path_rv, ptr, ptr],
                                needs_return=False)
 
     @staticmethod

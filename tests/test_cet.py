@@ -728,6 +728,18 @@ def test_jop_execve_sets_regs(jop_rop_full):
     assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
 
 
+def test_jop_syscall_rejects_bad_input(jop_rop_full):
+    # input guards on the JOP syscall/execve boundary must raise a clean RopException
+    import claripy
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    with pytest.raises(RopException):
+        js.do_syscall(60, 0xaa)                                       # args not a sequence
+    with pytest.raises(RopException):
+        js.execve(path_addr=claripy.BVS("p", rop.project.arch.bits))  # symbolic path_addr
+
+
 def test_jop_set_regs_rejects_bad_value_type(jop_rop_full):
     # a non-(int/str/BV) value must surface as a clean RopException at the public
     # boundary, not a bare ValueError leaking from cast_rop_value
