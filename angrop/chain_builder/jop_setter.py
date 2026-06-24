@@ -397,9 +397,8 @@ class JopSetter(Builder):
             for sc in syscalls:
                 used_before = list(Builder.used_writable_ptrs)
                 try:
+                    # _get_ptr_to_writable raises (not None) if the region is exhausted
                     buf = self._get_ptr_to_writable(len(words) * arch_bytes + arch_bytes)
-                    if buf is None:
-                        raise RopException("no writable buffer for the execve path string")
                     buf_rv = rop_utils.cast_rop_value(buf, self.project)
                     # store ops write the path words into the buffer; the terminal syscall op
                     # then runs execve(buf, 0, 0)
@@ -431,11 +430,8 @@ class JopSetter(Builder):
         final = chain.exec()
         if final.solver.eval(final.regs.ip) != chain.table_addrs[-1]:
             return False
-        for addr, data in writes:
-            word = final.memory.load(addr, self.project.arch.bytes,
-                                     endness=self.project.arch.memory_endness)
-            if final.solver.eval(word) != data:
-                return False
+        if not self._confirm_writes(final, writes):
+            return False
         for reg, val in reg_expect.items():
             if final.solver.eval(final.registers.load(reg)) != val:
                 return False
@@ -482,23 +478,42 @@ class JopSetter(Builder):
                 return False
         return True
 
+    @staticmethod
+    def _written_addrs(state):
+        """concrete base addresses of every memory-write action during the chain's exec."""
+        out = set()
+        for a in state.history.actions.hardcopy:
+            if a.type == "mem" and a.action == "write":
+                try:
+                    out.add(state.solver.eval(a.addr.ast))
+                except Exception: # pylint: disable=broad-except
+                    pass
+        return out
+
+    def _confirm_writes(self, final, writes):
+        """confirm every (addr, data) was actually written at `addr`. Checking the slot value
+        alone is not enough -- a zero data word at a wrong (zeroed) address reads back as
+        correct -- so also require that a store action landed at each address."""
+        written = self._written_addrs(final)
+        for addr, data in writes:
+            if addr not in written:
+                return False
+            word = final.memory.load(addr, self.project.arch.bytes,
+                                     endness=self.project.arch.memory_endness)
+            if final.solver.eval(word) != data:
+                return False
+        return True
+
     def _verify_mem(self, chain, addr, data):
         """exec() the JOP chain and confirm `data` landed at `addr`, ret-free."""
         final = chain.exec()
         if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
             return False
-        word = final.memory.load(addr, self.project.arch.bytes,
-                                 endness=self.project.arch.memory_endness)
-        return final.solver.eval(word) == data
+        return self._confirm_writes(final, [(addr, data)])
 
     def _verify_multimem(self, chain, writes):
         """exec() the JOP chain once and confirm every (addr, data) word landed, ret-free."""
         final = chain.exec()
         if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
             return False
-        for addr, data in writes:
-            word = final.memory.load(addr, self.project.arch.bytes,
-                                     endness=self.project.arch.memory_endness)
-            if final.solver.eval(word) != data:
-                return False
-        return True
+        return self._confirm_writes(final, writes)

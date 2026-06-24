@@ -724,6 +724,18 @@ def test_jop_write_to_mem_multiword_subword_tail(jop_rop_full):
     assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
 
 
+def test_jop_verify_rejects_unwritten_zero(jop_rop_full):
+    # _confirm_writes must reject a (addr, 0) claim for an address the chain never wrote: the
+    # zeroed slot reads back as 0, so a value-only check would spuriously pass. The fix also
+    # requires a store action to have landed at the address.
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    chain = rop.write_to_mem(0x500c00, (0x4141414141414141).to_bytes(8, "little"))
+    final = chain.exec()
+    assert js._confirm_writes(final, [(0x500c00, 0x4141414141414141)])   # real write confirmed
+    assert not js._confirm_writes(final, [(0x500c80, 0)])                # unwritten slot reads 0
+
+
 def test_jop_execve_routes_under_cet(jop_rop_full):
     # the public execve (no path_addr) routes through SysCaller under cet_forced to the JOP
     # string-staging path -- the real user entry point for a ret-free shell
