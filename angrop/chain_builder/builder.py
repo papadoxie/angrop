@@ -575,12 +575,21 @@ class Builder:
 
     @rop_utils.timeout(3)
     def _build_jop_chain(self, functional_gadgets, dispatcher, R, table_ptr,
-                         register_dict, constrained_addrs=None, terminal=False):
+                         register_dict=None, constrained_addrs=None, terminal=False,
+                         ops=None):
         """
         JOP-mode chain build (C5). Steps a symbolic state concretely through the
         dispatcher and the ordered functional gadgets (control is concrete for a fixed
         (D, R) -- only the pop-data is symbolic), reuses the shared solving core to
         constrain the requested register values, and emits a JopChain.
+
+        Single-point (default): constrain `register_dict` at the final (or terminal)
+        state. Multi-point: pass `ops` = an ordered list of `(gadget_index, register_dict)`
+        whose register values are constrained at the ENTRY of `functional_gadgets[gadget_index]`
+        (e.g. each store of a multi-word write, where the address register is reused across
+        ops). Each op routes through the SAME solving core (`_apply_target_constraints`), so
+        PIE rebase / register-move handling are preserved verbatim. `ops=None` reproduces the
+        single-point path exactly.
 
         Unlike the stack/ret path: entry is `pc = D` with `Rd = table_ptr - delta` and
         `R = D.addr` (no stack_pop); the next-gadget channel is the staged dispatch
@@ -599,8 +608,11 @@ class Builder:
 
         # the dispatch machinery registers (R, Rd) are pinned concrete for control flow
         # and preserved by every functional gadget, so they cannot be chain targets;
-        # reject cleanly rather than failing confusingly in the solving core (C8).
-        if R in register_dict or D.dispatch_reg in register_dict:
+        # reject cleanly rather than failing confusingly in the solving core (C8). The
+        # targets live in register_dict (single-point) or every op's dict (multi-point).
+        target_regs = set(register_dict or ()) if ops is None \
+            else set().union(*(rd for _, rd in ops)) if ops else set()
+        if R in target_regs or D.dispatch_reg in target_regs:
             raise RopException("JOP cannot set the dispatch machinery registers (R/Rd)")
         if R == D.dispatch_reg or R == self.arch.stack_pointer \
                 or D.dispatch_reg == self.arch.stack_pointer:
@@ -643,13 +655,25 @@ class Builder:
         # entry so register_dict is constrained right before it runs (the syscall clobbers
         # rax, so a back-at-D state could not pin the requested sysnum). C9.
         terminal_addr = functional_gadgets[-1].addr if terminal else None
+        # multi-point op constraint positions: (op gadget entry addr, register_dict), in the
+        # order the ops appear in the sequence (the same op gadget addr can repeat, so we
+        # match by occurrence with a counter, not by address)
+        op_positions = [(functional_gadgets[gi].addr, rd) for gi, rd in ops] if ops else []
+        captured = []     # (state copy at op entry, register_dict), one per op, in order
+        next_op = 0
         simgr = project.factory.simgr(state, save_unconstrained=True)
         returns_to_D = 0
         steps = 0
         budget = 8 * n + 16
         while True:
+            ip = state.solver.eval(state.regs.ip)
+            # snapshot the state at the entry of the next expected op gadget; its registers
+            # hold that op's values (set by the preceding pops), before the op runs
+            if next_op < len(op_positions) and ip == op_positions[next_op][0]:
+                captured.append((state.copy(), op_positions[next_op][1]))
+                next_op += 1
             if terminal:
-                if state.solver.eval(state.regs.ip) == terminal_addr:
+                if ip == terminal_addr:
                     break
             elif returns_to_D >= n:
                 break
@@ -663,10 +687,25 @@ class Builder:
                 returns_to_D += 1
             if steps > budget:
                 raise RopException("JOP build exceeded step budget")
+        if ops is not None and next_op != len(op_positions):
+            raise RopException("JOP build: did not reach every op constraint point")
 
         # ----- solve (shared, transit-agnostic core) -----
-        self._apply_target_constraints(state, register_dict, map_stack_var, constrained_addrs)
-        test_symbolic_state.solver.add(*state.solver.constraints)
+        if ops is None:
+            self._apply_target_constraints(state, register_dict, map_stack_var, constrained_addrs)
+            test_symbolic_state.solver.add(*state.solver.constraints)
+        else:
+            # constrain each op's registers at its captured entry state, each through the
+            # SAME solving core (preserving rebase/move handling) and sharing map_stack_var
+            # so the pop-data accumulates across ops. Process ops in REVERSE: a later op's
+            # captured state contains earlier ops' (still-unconstrained) symbolic store
+            # writes, whose addresses _apply_target_constraints' mem-access pass would remap
+            # to throwaway writable pointers -- clobbering the earlier op's correct pop-data
+            # mapping. Applying the earliest op last lets its register mapping win.
+            for cap_state, regdict in reversed(captured):
+                self._apply_target_constraints(cap_state, regdict, map_stack_var, constrained_addrs)
+                test_symbolic_state.solver.add(*cap_state.solver.constraints)
+            test_symbolic_state.solver.add(*state.solver.constraints)
 
         # honor roparg_filler for solver-free pop slots, exactly like the legacy path.
         # A JopChain disables the payload-time concretization path, so apply this at build
