@@ -833,6 +833,78 @@ def test_jop_execve_stages_string(jop_rop_full):
     assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
 
 
+def test_jop_func_call_sets_args(jop_rop_full):
+    # COP call (C10): set the function address (in the call-target reg) + arg regs, then
+    # dispatch to a `call reg` gadget as a terminal table entry; exec stops at the call entry
+    # with the function address and args set right before `call` fires (the callee's ret is
+    # shadow-stack-balanced, so this survives CET).
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    func = 0x401000
+    chain = js.func_call(func, [0xaabb, 0xccdd])
+    assert isinstance(chain, JopChain) and chain.terminal
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rax) == func          # call-target register
+    assert final.solver.eval(final.regs.rdi) == 0xaabb
+    assert final.solver.eval(final.regs.rsi) == 0xccdd
+    assert final.solver.eval(final.regs.rip) == chain.table_addrs[-1]
+
+
+def test_jop_call_gadgets_rejects_push_jmp_impostor(jop_rop_full):
+    # a `push <const>; jmp reg` has the SAME stack_change/mem_write as a call but does NOT
+    # push the shadow stack (Ijk_Boring) -- it must be rejected, or the callee's ret faults
+    # under CET. Detection keys on the Ijk_Call jumpkind, not the stack heuristic.
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    gadget_addrs = {g.addr for g in rop.chain_builder.gadgets}
+    call_addrs = {g.addr for g in js._call_gadgets()}
+    assert _g(rop, "g_call_rax").addr in call_addrs           # real call accepted
+    push_jmp = _g(rop, "g_push_jmp").addr
+    if push_jmp in gadget_addrs:                              # if discovered, must be rejected
+        assert push_jmp not in call_addrs
+
+
+def test_jop_func_call_routes_and_guards(jop_rop_full):
+    # the public func_call routes through FuncCaller under cet_forced to the COP path;
+    # needs_return=True (continuation after a ret-free call) is an explicit limitation
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    chain = rop.chain_builder.func_call(0x401000, [0xaa])
+    assert isinstance(chain, JopChain) and chain.terminal
+    with pytest.raises(RopException):
+        rop.chain_builder.func_call(0x401000, [0x1], needs_return=True)
+
+
+def test_jop_func_call_skips_clobbering_call_gadget(jop_rop_full, monkeypatch):
+    # a call gadget that writes a target reg before the call (mov rdi,rbx; call rax) would
+    # verify-at-entry but fire the call with the wrong rdi -- skip it when rdi is an argument.
+    # This is the guard that makes verify-at-entry valid for calls (mirrors the syscall one).
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    clob = _g(rop, "g_call_clobber")
+    assert "rdi" in clob.changed_regs                       # writes rdi before the call
+    monkeypatch.setattr(js, "_call_gadgets", lambda: [clob])
+    with pytest.raises(RopException):                        # rdi is an arg -> unsafe -> skip
+        js.func_call(0x401000, [0xaa])
+    chain = js.func_call(0x401000, [])                       # no rdi arg -> harmless -> builds
+    assert isinstance(chain, JopChain)
+    assert chain.exec().solver.eval(chain.exec().regs.rax) == 0x401000
+
+
+def test_jop_func_call_pie_preserves_rebase(jop_rop_pie):
+    # the resolved function-address pop-data must carry rebase on PIE so the call survives ASLR
+    rop = jop_rop_pie
+    js = rop.chain_builder._jop_setter
+    func = rop.project.loader.find_symbol("g_pop_rdi").rebased_addr
+    chain = js.func_call(func, [0x1234])
+    assert any(v.rebase for v in chain._values)             # the func-addr pop-data is rebased
+
+
 def test_jop_syscall_rejects_bad_input(jop_rop_full):
     # input guards on the JOP syscall/execve boundary must raise a clean RopException
     import claripy
