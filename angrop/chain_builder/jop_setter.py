@@ -156,6 +156,73 @@ class JopSetter(Builder):
         raise RopException("JOP: couldn't build the requested primitive with the "
                            "available dispatcher/functional gadgets")
 
+    def _build_multiop(self, ops_spec, preserve_regs=None, verify_fn=None, terminal_last=False):
+        """
+        Build ONE JOP chain that performs a SEQUENCE of operations. `ops_spec` is an ordered
+        list of (reg_targets, op_gadget): for each op, set reg_targets via the search then run
+        op_gadget. All ops share one (D, R)/dispatch table, and each op's registers are
+        constrained at ITS op gadget (so a register reused across ops -- e.g. the store
+        address reg -- can hold a different value per op). `terminal_last` marks the final
+        op_gadget as a stop-at-entry terminal (a syscall). (D, R) is the outer loop: if any
+        op's search fails for a candidate (D, R), fall through to the next.
+        """
+        preserve_regs = set(preserve_regs) if preserve_regs else set()
+        if verify_fn is None:
+            raise RopException("multi-op build requires a verify function")
+        rs = self.chain_builder._reg_setter
+        try:
+            specs = [({rr: rop_utils.cast_rop_value(v, self.project) for rr, v in rt.items()}, g)
+                     for rt, g in ops_spec]
+        except ValueError as e:
+            raise RopException(str(e)) from e
+
+        for d, r in self._candidate_dr():
+            rd = d.dispatch_reg
+            # every op must transfer correctly for this (D, R): a store returns to D
+            # (is_functional); a terminal-last op only needs to be a valid table entry (endbr).
+            # No op may target the dispatch machinery regs (R/Rd).
+            ok = True
+            for i, (rt, g) in enumerate(specs):
+                if set(rt) & {r, rd}:
+                    ok = False
+                    break
+                if terminal_last and i == len(specs) - 1:
+                    if not g.has_endbr:
+                        ok = False
+                        break
+                elif not g.is_functional(r, rd):
+                    ok = False
+                    break
+            if not ok:
+                continue
+
+            used_before = list(Builder.used_writable_ptrs)
+            try:
+                full, ops = [], []
+                for rt, g in specs:
+                    pool = self._functional_pool(r, rd, set(rt))
+                    if not pool:
+                        raise RopException("no functional pool for this op")
+                    accept = lambda gg, _r=r, _rd=rd: gg.is_functional(_r, _rd)
+                    seqs = rs.find_candidate_chains_giga_graph_search(
+                        None, dict(rt), preserve_regs, False,
+                        gadgets=pool, accept=accept, handle_hard=False)
+                    seq = next(iter(seqs), None)
+                    if seq is None:
+                        raise RopException("op search produced no sequence")
+                    full.extend(seq)
+                    ops.append((len(full), rt))   # index of the op gadget appended next
+                    full.append(g)
+                table_ptr = self._alloc_table_ptr(len(full), d.dispatch_stride)
+                chain = self._build_jop_chain(full, d, r, table_ptr, ops=ops,
+                                              terminal=terminal_last)
+                if verify_fn(chain):
+                    return chain
+            except RopException:
+                pass
+            Builder.used_writable_ptrs[:] = used_before
+        raise RopException("JOP: couldn't build the requested multi-operation primitive")
+
     def set_regs(self, preserve_regs=None, **registers):
         if not registers:
             from ..rop_chain import RopChain # pylint: disable=import-outside-toplevel
@@ -164,11 +231,13 @@ class JopSetter(Builder):
 
     def write_to_mem(self, addr, data, preserve_regs=None, fill_byte=b"\xff"):
         """
-        Ret-free word-sized memory write via a functional store gadget
-        (`mov [addr_reg], data_reg ; jmp R`): set addr_reg=addr and data_reg=data via the
-        search, then run the store as a (functional) table entry that returns to D.
-        `data` is a single machine word (bytes or int); sub-word `data` is padded with
-        `fill_byte` (default 0xff, matching MemWriter -- 0x00 is a common badbyte).
+        Ret-free memory write via a functional store gadget (`mov [addr_reg], data_reg; jmp R`):
+        set addr_reg/data_reg via the search and run the store as a table entry returning to D.
+        `data` longer than one machine word is chunked into consecutive word-stores composed
+        into ONE chain (the multi-operation builder), so each word's address/data are
+        constrained at its own store (the address register is reused across stores). A
+        sub-word tail is padded with `fill_byte` (default 0xff, matching MemWriter -- 0x00 is
+        a common badbyte).
         """
         arch_bytes = self.project.arch.bytes
         endian = "little" if self.project.arch.memory_endness == "Iend_LE" else "big"
@@ -188,32 +257,39 @@ class JopSetter(Builder):
             raise RopException(str(e)) from e
         if addr_rv.symbolic:
             raise RopException("cannot write to a symbolic address")
+        # chunk data into machine words (sub-word tail padded with fill_byte)
         if isinstance(data, bytes):
-            if len(data) > arch_bytes:
-                # multi-word writes (e.g. "/bin/sh"+argv) need chunked stores -- a future
-                # increment; for now handle a single machine word and fail clearly otherwise
-                raise RopException("JOP write_to_mem currently handles word-sized writes only")
-            data = int.from_bytes(data.ljust(arch_bytes, fill_byte), endian)
-        elif not isinstance(data, int):
+            words = [int.from_bytes(data[i:i + arch_bytes].ljust(arch_bytes, fill_byte), endian)
+                     for i in range(0, len(data), arch_bytes)]
+        elif isinstance(data, int):
+            words = [data]
+        else:
             raise RopException("data must be bytes or an int")
+        if not words:
+            raise RopException("JOP write_to_mem: no data to write")
         addr_val = addr_rv.concreted
 
         for store in self._functional_stores():
             mw = store.mem_writes[0]
             addr_reg = self._single(mw.addr_dependencies)
             data_reg = self._single(mw.data_dependencies)
-            if addr_reg is None or data_reg is None or addr_reg == data_reg:
+            if addr_reg is None or addr_reg == data_reg or data_reg is None:
                 continue
-            # the store writes to [addr_reg + addr_offset]; fold the displacement into the
-            # addr-register target so the write lands at `addr` (PIE rebase preserved via
-            # RopValue arithmetic). _verify_mem still reads `addr`, so a wrong offset just
-            # fails verification and the candidate is dropped -- never a bad chain.
-            addr_target = addr_rv + (-(mw.addr_offset or 0))
-            targets = {addr_reg: addr_target, data_reg: data}
-            verify = lambda chain, _a=addr_val, _d=data: self._verify_mem(chain, _a, _d)
+            off = mw.addr_offset or 0
+            # one op per word: word_i lands at addr + i*arch_bytes. Fold the store
+            # displacement into the addr-register target so the write hits the right slot
+            # (PIE rebase preserved via RopValue arithmetic); a wrong offset only fails the
+            # verify and drops the candidate, never a bad chain.
+            ops_spec = [({addr_reg: addr_rv + (i * arch_bytes - off), data_reg: w}, store)
+                        for i, w in enumerate(words)]
+            writes = [(addr_val + i * arch_bytes, w) for i, w in enumerate(words)]
             try:
-                return self._build_for(targets, terminals=[store],
-                                       preserve_regs=preserve_regs, verify_fn=verify)
+                if len(words) == 1:
+                    verify = lambda c, _a=writes[0][0], _d=writes[0][1]: self._verify_mem(c, _a, _d)
+                    return self._build_for(ops_spec[0][0], terminals=[store],
+                                           preserve_regs=preserve_regs, verify_fn=verify)
+                verify = lambda c, _w=list(writes): self._verify_multimem(c, _w)
+                return self._build_multiop(ops_spec, preserve_regs=preserve_regs, verify_fn=verify)
             except RopException:
                 continue
         raise RopException("JOP: couldn't write to memory with the available gadgets")
@@ -276,23 +352,94 @@ class JopSetter(Builder):
 
     def execve(self, path=None, path_addr=None):
         """
-        Ret-free execve (C9). Requires the path string to already be in memory at
-        `path_addr` (e.g. a "/bin/sh" literal in the target); staging the string into
-        memory in the same chain needs the multi-operation builder (a later increment).
-        Invokes execve(path_addr, 0, 0) via a terminal syscall.
+        Ret-free execve (C9). If `path_addr` is given the path string must already be in
+        memory there, and only the execve syscall is built. Otherwise the path string is
+        staged into a fresh writable buffer AND the execve syscall is invoked -- both in ONE
+        chain via the multi-operation builder ([string-word stores] + [terminal syscall]).
         """
-        if path_addr is None:
-            raise RopException("JOP execve currently requires path_addr (the path string "
-                               "must already be in memory)")
-        # the syscall needs a concrete pointer in rdi; reject a symbolic path_addr cleanly
-        # (consistent with write_to_mem) rather than building a chain that merely leaves rdi
-        # controllable
-        path_rv = rop_utils.cast_rop_value(path_addr, self.project)
-        if path_rv.symbolic:
-            raise RopException("JOP execve requires a concrete path_addr")
-        ptr = rop_utils.cast_rop_value(0, self.project)
-        return self.do_syscall(self.arch.execve_num, [path_rv, ptr, ptr],
-                               needs_return=False)
+        arch_bytes = self.project.arch.bytes
+        endian = "little" if self.project.arch.memory_endness == "Iend_LE" else "big"
+        ptr0 = rop_utils.cast_rop_value(0, self.project)
+
+        if path_addr is not None:
+            # path already in memory: just the syscall (reject a symbolic pointer cleanly,
+            # consistent with write_to_mem)
+            path_rv = rop_utils.cast_rop_value(path_addr, self.project)
+            if path_rv.symbolic:
+                raise RopException("JOP execve requires a concrete path_addr")
+            return self.do_syscall(self.arch.execve_num, [path_rv, ptr0, ptr0],
+                                   needs_return=False)
+
+        # stage the path string + execve in one chain
+        if path is None:
+            path = b"/bin/sh\x00"
+        if not isinstance(path, bytes):
+            raise RopException("execve path must be bytes")
+        if not path.endswith(b"\x00"):
+            path += b"\x00"
+        words = [int.from_bytes(path[i:i + arch_bytes].ljust(arch_bytes, b"\x00"), endian)
+                 for i in range(0, len(path), arch_bytes)]
+
+        syscalls = self._syscall_gadgets()
+        if not syscalls:
+            raise RopException("target has no endbr syscall gadget for a ret-free execve")
+        sysnum_reg = self.project.arch.register_names[self.project.arch.syscall_num_offset]
+        import angr # pylint: disable=import-outside-toplevel
+        arg_regs = angr.SYSCALL_CC[self.project.arch.name]["default"](self.project.arch).ARG_REGS
+
+        for store in self._functional_stores():
+            mw = store.mem_writes[0]
+            addr_reg = self._single(mw.addr_dependencies)
+            data_reg = self._single(mw.data_dependencies)
+            if addr_reg is None or data_reg is None or addr_reg == data_reg:
+                continue
+            off = mw.addr_offset or 0
+            for sc in syscalls:
+                used_before = list(Builder.used_writable_ptrs)
+                try:
+                    buf = self._get_ptr_to_writable(len(words) * arch_bytes + arch_bytes)
+                    if buf is None:
+                        raise RopException("no writable buffer for the execve path string")
+                    buf_rv = rop_utils.cast_rop_value(buf, self.project)
+                    # store ops write the path words into the buffer; the terminal syscall op
+                    # then runs execve(buf, 0, 0)
+                    sys_targets = {sysnum_reg: self.arch.execve_num,
+                                   arg_regs[0]: buf_rv, arg_regs[1]: ptr0, arg_regs[2]: ptr0}
+                    # the syscall prologue must not clobber a target reg (verify stops at the
+                    # syscall entry, like do_syscall)
+                    prologue = getattr(sc, "prologue", None)
+                    if prologue is not None and \
+                            (set(prologue.changed_regs) | set(prologue.concrete_regs)) & set(sys_targets):
+                        raise RopException("syscall prologue clobbers a target register")
+                    ops_spec = [({addr_reg: buf_rv + (i * arch_bytes - off), data_reg: w}, store)
+                                for i, w in enumerate(words)]
+                    ops_spec.append((sys_targets, sc))
+                    writes = [(buf_rv.concreted + i * arch_bytes, w) for i, w in enumerate(words)]
+                    reg_expect = {sysnum_reg: self.arch.execve_num,
+                                  arg_regs[0]: buf_rv.concreted, arg_regs[1]: 0, arg_regs[2]: 0}
+                    verify = lambda c, _w=writes, _e=dict(reg_expect): self._verify_execve(c, _w, _e)
+                    return self._build_multiop(ops_spec, verify_fn=verify, terminal_last=True)
+                except RopException:
+                    Builder.used_writable_ptrs[:] = used_before
+                    continue
+        raise RopException("JOP: couldn't build a ret-free execve with the available gadgets")
+
+    def _verify_execve(self, chain, writes, reg_expect):
+        """exec() the terminal chain (stops at the syscall entry) and confirm the path string
+        landed in the buffer and the syscall number + argument registers are set right before
+        the syscall runs."""
+        final = chain.exec()
+        if final.solver.eval(final.regs.ip) != chain.table_addrs[-1]:
+            return False
+        for addr, data in writes:
+            word = final.memory.load(addr, self.project.arch.bytes,
+                                     endness=self.project.arch.memory_endness)
+            if final.solver.eval(word) != data:
+                return False
+        for reg, val in reg_expect.items():
+            if final.solver.eval(final.registers.load(reg)) != val:
+                return False
+        return True
 
     @staticmethod
     def _single(dep_set):
@@ -343,3 +490,15 @@ class JopSetter(Builder):
         word = final.memory.load(addr, self.project.arch.bytes,
                                  endness=self.project.arch.memory_endness)
         return final.solver.eval(word) == data
+
+    def _verify_multimem(self, chain, writes):
+        """exec() the JOP chain once and confirm every (addr, data) word landed, ret-free."""
+        final = chain.exec()
+        if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
+            return False
+        for addr, data in writes:
+            word = final.memory.load(addr, self.project.arch.bytes,
+                                     endness=self.project.arch.memory_endness)
+            if final.solver.eval(word) != data:
+                return False
+        return True

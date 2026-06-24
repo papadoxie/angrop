@@ -90,6 +90,14 @@ def jop_bin(tmp_path_factory):
     return _build("jop_gadgets.c", out, ["-fcf-protection=full", "-O0", "-no-pie"])
 
 
+@pytest.fixture(scope="session")
+def jop_bin_pie(tmp_path_factory):
+    if not _gcc_supports_cf_protection():
+        pytest.skip("gcc with -fcf-protection not available")
+    out = str(tmp_path_factory.mktemp("jop_pie") / "jop_gadgets_pie")
+    return _build("jop_gadgets.c", out, ["-fcf-protection=full", "-O0", "-pie", "-fPIE"])
+
+
 def _arch(path):
     return get_arch(angr.Project(path, auto_load_libs=False))
 
@@ -540,6 +548,35 @@ def jop_rop_full(jop_bin):
     return rop
 
 
+@pytest.fixture(scope="module")
+def jop_rop_pie(jop_bin_pie):
+    proj = angr.Project(jop_bin_pie, auto_load_libs=False)
+    rop = proj.analyses.ROP(cet=True)
+    rop.find_gadgets_single_threaded()
+    return rop
+
+
+def test_jop_execve_pie_preserves_rebase(jop_rop_pie):
+    # on a PIE binary the staged buffer pointer must carry the rebase relationship so the
+    # chain survives ASLR; immediates and string data must NOT be rebased. (The -no-pie
+    # fixture can't catch a dropped rebase -- everything reads back the same -- so this is
+    # the test that locks rebase by checking the RopValue, not just the value.)
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_pie
+    assert rop.project.loader.main_object.pic        # sanity: actually PIE
+    chain = rop.chain_builder._jop_setter.execve()   # stages "/bin/sh" into a PIC buffer
+    assert isinstance(chain, JopChain)
+    # the buffer pointer pop-data (store address + rdi=buf) is rebased; the string word, the
+    # zero args and the sysnum are plain immediates and must not be rebased
+    assert any(v.rebase for v in chain._values)
+    assert all(not v.rebase for v in chain._values
+               if not v.symbolic and v.concreted in (0, rop.arch.execve_num))
+    final = chain.exec()
+    buf = final.solver.eval(final.regs.rdi)
+    assert final.solver.eval(final.memory.load(buf, 8), cast_to=bytes) == b"/bin/sh\x00"
+
+
 def test_jop_set_regs_end_to_end(jop_rop_full):
     # C9 gate: under shstk, rop.set_regs routes to the JOP orchestrator, which selects
     # a (D, R), searches the functional pool, and emits a ret-free JopChain.
@@ -624,8 +661,6 @@ def test_jop_write_to_mem_rejects_bad_input(jop_rop_full):
     with pytest.raises(RopException):
         js.write_to_mem(sym_addr, b"\x00" * 8)          # symbolic address
     with pytest.raises(RopException):
-        js.write_to_mem(0x500000, b"A" * 16)            # multi-word data (not yet supported)
-    with pytest.raises(RopException):
         js.write_to_mem(0x500000, object())             # bad data type
     with pytest.raises(RopException):
         js.write_to_mem(object(), b"\x00" * 8)          # bad addr type (must be clean RopException)
@@ -657,6 +692,46 @@ def test_jop_write_to_mem_compensates_addr_offset(jop_rop_full, monkeypatch):
     word = final.memory.load(addr, 8, endness=rop.project.arch.memory_endness)
     assert final.solver.eval(word) == value
     assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+
+
+def test_jop_write_to_mem_multiword(jop_rop_full):
+    # data longer than a machine word is chunked into consecutive word-stores composed into
+    # ONE chain (the multi-operation builder); each store's addr/data are constrained at its
+    # own point so the reused address register holds a different value per word.
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    addr = 0x500a00
+    data = b"ABCDEFGHIJKLMNOP"          # 16 bytes = 2 words
+    chain = rop.write_to_mem(addr, data)
+    assert isinstance(chain, JopChain)
+    final = chain.exec()
+    assert final.solver.eval(final.memory.load(addr, len(data)), cast_to=bytes) == data
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+
+
+def test_jop_write_to_mem_multiword_subword_tail(jop_rop_full):
+    # N>=3 words including a sub-word tail padded with fill_byte; locks the reverse-order
+    # generalization and the multi-op padding path
+    rop = jop_rop_full
+    addr = 0x500b00
+    data = b"0123456789ABCDEFXY"          # 18 bytes = 2 full words + a 2-byte tail
+    chain = rop.write_to_mem(addr, data)   # default fill_byte 0xff
+    final = chain.exec()
+    raw = final.solver.eval(final.memory.load(addr, 24), cast_to=bytes)  # 3 words staged
+    assert raw[:len(data)] == data
+    assert raw[len(data):] == b"\xff" * (24 - len(data))   # sub-word tail padded with fill_byte
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+
+
+def test_jop_execve_routes_under_cet(jop_rop_full):
+    # the public execve (no path_addr) routes through SysCaller under cet_forced to the JOP
+    # string-staging path -- the real user entry point for a ret-free shell
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    chain = rop.chain_builder.execve()
+    assert isinstance(chain, JopChain) and chain.terminal
 
 
 def test_jop_do_syscall_sets_args(jop_rop_full):
@@ -723,6 +798,24 @@ def test_jop_execve_sets_regs(jop_rop_full):
     assert isinstance(chain, JopChain) and chain.terminal
     final = chain.exec()
     assert final.solver.eval(final.regs.rdi) == 0x500000
+    assert final.solver.eval(final.regs.rsi) == 0
+    assert final.solver.eval(final.regs.rdx) == 0
+    assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
+
+
+def test_jop_execve_stages_string(jop_rop_full):
+    # full ret-free execve: stage "/bin/sh\0" into a fresh buffer AND invoke the execve
+    # syscall in ONE chain ([string-word stores] + [terminal syscall]); exec stops at the
+    # syscall entry with the string written and the args set.
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    chain = js.execve()                          # default path b"/bin/sh\x00"
+    assert isinstance(chain, JopChain) and chain.terminal
+    final = chain.exec()
+    buf = final.solver.eval(final.regs.rdi)
+    assert final.solver.eval(final.memory.load(buf, 8), cast_to=bytes) == b"/bin/sh\x00"
     assert final.solver.eval(final.regs.rsi) == 0
     assert final.solver.eval(final.regs.rdx) == 0
     assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
