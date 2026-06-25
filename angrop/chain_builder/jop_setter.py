@@ -514,6 +514,80 @@ class JopSetter(Builder):
                 continue
         raise RopException("JOP: couldn't invoke the function with the available call gadgets")
 
+    def _shift_gadgets(self, length):
+        """functional gadgets that advance rsp by exactly `length` with no register/memory
+        side effects (`add rsp, length ; jmp R`) -- a ret-free stack shift (C11)."""
+        out = []
+        for g in self.chain_builder.gadgets:
+            if g.transit_type != "jmp_reg" or not g.has_endbr or g.has_conditional_branch:
+                continue
+            if g.stack_change != length:
+                continue
+            if g.changed_regs or g.popped_regs or g.mem_writes or g.mem_reads or g.mem_changes:
+                continue
+            out.append(g)
+        return out
+
+    def _pivot_gadgets(self):
+        """functional pivot gadgets (`mov rsp, reg ; jmp R`) -- relocate rsp ret-free (C11).
+        Sourced from the pivot pool (the analyzer keeps PivotGadgets separately)."""
+        return [g for g in (self.chain_builder.pivot_gadgets or [])
+                if g.has_endbr and not g.has_conditional_branch and g.sp_reg_controllers]
+
+    def shift(self, length, preserve_regs=None): # pylint: disable=unused-argument
+        """Ret-free stack shift (C11): run a functional `add rsp, length ; jmp R` gadget as a
+        table entry, advancing rsp by `length` and returning to the dispatcher. Only
+        side-effect-free shift gadgets are used (no register pops, no memory access), so
+        `preserve_regs` is moot; chained / pop-based shifts are not supported. The verify
+        executes the gadget and checks the actual rsp delta, so no clobber guard is needed."""
+        gadgets = self._shift_gadgets(length)
+        if not gadgets:
+            raise RopException(f"no ret-free shift gadget for length {length:#x}")
+        for g in gadgets:
+            verify = lambda chain, _l=length: self._verify_shift(chain, _l)
+            try:
+                return self._build_for({}, terminals=[g], preserve_regs=preserve_regs,
+                                       verify_fn=verify)
+            except RopException:
+                continue
+        raise RopException("JOP: couldn't build a ret-free stack shift")
+
+    def pivot(self, thing):
+        """Ret-free stack pivot (C11): set a pivot gadget's sp-controller register to the new
+        rsp via the search, then run the functional `mov rsp, reg ; jmp R` gadget -- rsp is
+        relocated and control returns to the dispatcher. Supports DIRECT-register pivots
+        (`mov rsp, reg` / `xchg`) to a CONCRETE target; a memory-indirect pivot (`mov rsp,
+        [reg]`, `pop rsp`) classifies with no sp_reg_controllers and is excluded, and a
+        symbolic / pivot-to-register target raises. The verify executes the gadget and checks
+        the actual rsp afterwards, so the result is genuine (no clobber guard needed)."""
+        new_sp = thing if isinstance(thing, RopValue) else rop_utils.cast_rop_value(thing, self.project)
+        if new_sp.symbolic:
+            raise RopException("JOP pivot requires a concrete target stack pointer")
+        for pg in self._pivot_gadgets():
+            for ctrl in pg.sp_reg_controllers:
+                verify = lambda chain, _v=new_sp.concreted: self._verify_pivot(chain, _v)
+                try:
+                    return self._build_for({ctrl: new_sp}, terminals=[pg], verify_fn=verify)
+                except RopException:
+                    continue
+        raise RopException("JOP: couldn't pivot the stack with the available gadgets")
+
+    def _verify_shift(self, chain, length):
+        """exec() and confirm rsp advanced by exactly `length`, ret-free at the dispatcher."""
+        init = chain._stage_state()
+        init_sp = init.solver.eval(init.regs.sp)
+        final = chain.exec()
+        if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
+            return False
+        return (final.solver.eval(final.regs.sp) - init_sp) % (1 << self.project.arch.bits) == length
+
+    def _verify_pivot(self, chain, new_sp):
+        """exec() and confirm rsp was relocated to `new_sp`, ret-free at the dispatcher."""
+        final = chain.exec()
+        if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
+            return False
+        return final.solver.eval(final.regs.sp) == new_sp
+
     def _verify_execve(self, chain, writes, reg_expect):
         """exec() the terminal chain (stops at the syscall entry) and confirm the path string
         landed in the buffer and the syscall number + argument registers are set right before
