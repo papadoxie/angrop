@@ -464,10 +464,11 @@ class JopSetter(Builder):
     def func_call(self, address, args, needs_return=False, preserve_regs=None):
         """
         Ret-free function call (COP, C10). A `call reg` gadget pushes the return address to the
-        shadow stack and the callee's matching `ret` is balanced (no CET fault); the post-call
-        continuation goes ret-free via the gadget's trailing `jmp R`. The build stops at the
-        call gadget's entry with the function address (in the call-target register) and the
-        argument registers set -- the call fires at exploit time. `needs_return=True`
+        shadow stack and the callee's matching `ret` is balanced (no CET fault); a COP call
+        gadget's instruction after the `call` (e.g. a `jmp R`) provides the ret-free
+        continuation at exploit time. The build stops at the call gadget's entry with the
+        function address (in the call-target register) and the argument registers set; the call
+        fires at exploit time and analysis does not track past it. `needs_return=True`
         (continuing the chain *after* the call) needs the hook-and-step + callee-saved R/Rd
         and is not supported here; post-call behaviour for a returning function is undefined.
         """
@@ -476,6 +477,12 @@ class JopSetter(Builder):
             raise RopException("JOP func_call: needs_return=True is not yet supported "
                                "(continuation after a ret-free call); pass needs_return=False")
         func_rv = self._resolve_func_addr(address)
+        # the call needs a concrete target in pc_reg; reject a symbolic address cleanly
+        # (consistent with write_to_mem/execve) rather than leaving the call target controllable
+        if func_rv.symbolic:
+            raise RopException("JOP func_call requires a concrete function address")
+        if not isinstance(args, (list, tuple)):
+            raise RopException("JOP func_call: args must be a list or tuple of register values")
         args = list(args)
         cc = angr.default_cc(self.project.arch.name,
                              platform=self.project.simos.name if self.project.simos else None

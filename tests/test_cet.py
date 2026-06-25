@@ -896,13 +896,29 @@ def test_jop_func_call_skips_clobbering_call_gadget(jop_rop_full, monkeypatch):
     assert chain.exec().solver.eval(chain.exec().regs.rax) == 0x401000
 
 
+def test_jop_func_call_rejects_bad_input(jop_rop_full):
+    # input guards on the COP boundary must raise a clean RopException (parity with
+    # do_syscall/execve): a non-sequence args and a symbolic function address
+    import claripy
+    from angrop.rop_value import RopValue
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    with pytest.raises(RopException):
+        js.func_call(0x401000, 5)                          # args not a sequence
+    with pytest.raises(RopException):
+        sym = RopValue(claripy.BVS("f", rop.project.arch.bits), rop.project)
+        js.func_call(sym, [])                              # symbolic function address
+
+
 def test_jop_func_call_pie_preserves_rebase(jop_rop_pie):
     # the resolved function-address pop-data must carry rebase on PIE so the call survives ASLR
     rop = jop_rop_pie
     js = rop.chain_builder._jop_setter
     func = rop.project.loader.find_symbol("g_pop_rdi").rebased_addr
     chain = js.func_call(func, [0x1234])
-    assert any(v.rebase for v in chain._values)             # the func-addr pop-data is rebased
+    # the func-addr pop-data specifically must be rebased (not merely some other staged value)
+    assert any(v.rebase and v.concreted == func for v in chain._values)
 
 
 def test_jop_syscall_rejects_bad_input(jop_rop_full):
