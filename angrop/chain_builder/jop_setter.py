@@ -423,6 +423,97 @@ class JopSetter(Builder):
                     continue
         raise RopException("JOP: couldn't build a ret-free execve with the available gadgets")
 
+    def _call_gadgets(self):
+        """endbr CALL gadgets (`... ; call reg`) usable as a terminal COP table entry. The
+        precise signal is the terminating block's Ijk_Call jumpkind: a `push <const>; jmp reg`
+        has the SAME stack_change/mem_write but does NOT push the shadow stack, so the callee's
+        `ret` would fault under CET. Verify-at-entry can't observe this (we stop before the
+        call), so detection must be exact -- the stack/mem-write heuristic alone is unsafe."""
+        out = []
+        for g in self.chain_builder.gadgets:
+            if g.transit_type != "jmp_reg" or not g.has_endbr or g.has_conditional_branch:
+                continue
+            if not getattr(g, "pc_reg", None):
+                continue
+            try:
+                last_blk = g.bbl_addrs[-1] if getattr(g, "bbl_addrs", None) else g.addr
+                if self.project.factory.block(last_blk).vex.jumpkind != "Ijk_Call":
+                    continue
+            except Exception: # pylint: disable=broad-except
+                continue
+            out.append(g)
+        return out
+
+    def _resolve_func_addr(self, address):
+        """resolve a function symbol / PLT name / address to a (rebase-aware) RopValue."""
+        if isinstance(address, RopValue):
+            return address
+        if isinstance(address, str):
+            main = self.project.loader.main_object
+            if getattr(main, "plt", None) and address in main.plt:
+                address = main.plt[address]
+            else:
+                sym = main.get_symbol(address)
+                if sym is None:
+                    raise RopException(f"symbol {address!r} not found in the binary")
+                address = sym.rebased_addr
+        if not isinstance(address, int):
+            raise RopException("func_call address must be an int, a symbol name, or a RopValue")
+        return rop_utils.cast_rop_value(address, self.project)
+
+    def func_call(self, address, args, needs_return=False, preserve_regs=None):
+        """
+        Ret-free function call (COP, C10). A `call reg` gadget pushes the return address to the
+        shadow stack and the callee's matching `ret` is balanced (no CET fault); a COP call
+        gadget's instruction after the `call` (e.g. a `jmp R`) provides the ret-free
+        continuation at exploit time. The build stops at the call gadget's entry with the
+        function address (in the call-target register) and the argument registers set; the call
+        fires at exploit time and analysis does not track past it. `needs_return=True`
+        (continuing the chain *after* the call) needs the hook-and-step + callee-saved R/Rd
+        and is not supported here; post-call behaviour for a returning function is undefined.
+        """
+        import angr # pylint: disable=import-outside-toplevel
+        if needs_return:
+            raise RopException("JOP func_call: needs_return=True is not yet supported "
+                               "(continuation after a ret-free call); pass needs_return=False")
+        func_rv = self._resolve_func_addr(address)
+        # the call needs a concrete target in pc_reg; reject a symbolic address cleanly
+        # (consistent with write_to_mem/execve) rather than leaving the call target controllable
+        if func_rv.symbolic:
+            raise RopException("JOP func_call requires a concrete function address")
+        if not isinstance(args, (list, tuple)):
+            raise RopException("JOP func_call: args must be a list or tuple of register values")
+        args = list(args)
+        cc = angr.default_cc(self.project.arch.name,
+                             platform=self.project.simos.name if self.project.simos else None
+                             )(self.project.arch)
+        if len(args) > len(cc.ARG_REGS):
+            raise RopException("JOP func_call: stack call arguments are not supported")
+        gadgets = self._call_gadgets()
+        if not gadgets:
+            raise RopException("target has no endbr call gadget for a ret-free COP call")
+        arg_map = dict(zip(cc.ARG_REGS, args))
+        for cg in gadgets:
+            pc_reg = cg.pc_reg
+            if pc_reg in arg_map: # the call-target register can't also carry an argument
+                continue
+            reg_targets = {pc_reg: func_rv}
+            reg_targets.update(arg_map)
+            # verify stops at the call entry; gadget analysis stops at the call, so the call
+            # gadget's own changed_regs ARE its entry->call effect set. If it writes a target
+            # register before the call (e.g. `mov rdi, rbx; call rax`), verify-at-entry would
+            # pass but the call would fire with the wrong value -- skip such a gadget. Union
+            # concrete_regs for parity with the syscall prologue guard (concrete_regs is a
+            # subset, but keep the check identical).
+            if (set(cg.changed_regs) | set(cg.concrete_regs)) & set(reg_targets):
+                continue
+            try:
+                return self._build_for(reg_targets, terminals=[cg],
+                                       preserve_regs=preserve_regs, terminal=True)
+            except RopException:
+                continue
+        raise RopException("JOP: couldn't invoke the function with the available call gadgets")
+
     def _verify_execve(self, chain, writes, reg_expect):
         """exec() the terminal chain (stops at the syscall entry) and confirm the path string
         landed in the buffer and the syscall number + argument registers are set right before

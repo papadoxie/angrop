@@ -78,6 +78,25 @@ __asm__(
 "    syscall\n"
 "    jmp  *%rbx\n"
 ".p2align 4\n"
+".globl g_call_rax\n"          /* COP call gadget: endbr64; call rax; jmp rbx (Ijk_Call) */
+"g_call_rax:\n"
+"    endbr64\n"
+"    call *%rax\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
+".globl g_push_jmp\n"          /* call IMPOSTOR: endbr64; push $imm; jmp rax (same stack effect, Ijk_Boring) */
+"g_push_jmp:\n"
+"    endbr64\n"
+"    push $0x401100\n"
+"    jmp  *%rax\n"
+".p2align 4\n"
+".globl g_call_clobber\n"      /* call gadget that writes rdi before the call (entry->call clobbers rdi) */
+"g_call_clobber:\n"
+"    endbr64\n"
+"    mov  %rbx, %rdi\n"
+"    call *%rax\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
 ".globl g_clobber\n"            /* NOT a dispatcher: also clobbers rcx (changed_regs not subset {rbp}) */
 "g_clobber:\n"
 "    endbr64\n"
@@ -88,8 +107,8 @@ __asm__(
 extern void g_disp(void), g_disp_c0(void), g_disp_sub(void), g_pop_rdi(void),
             g_pop_rdi_ret(void), g_pop_rsi(void), g_pop_rdx(void), g_pop_rax(void),
             g_store(void), g_store_off(void), g_syscall(void), g_syscall_xor(void),
-            g_clobber(void);
+            g_call_rax(void), g_push_jmp(void), g_call_clobber(void), g_clobber(void);
 void *keep[] = { g_disp, g_disp_c0, g_disp_sub, g_pop_rdi, g_pop_rdi_ret,
                  g_pop_rsi, g_pop_rdx, g_pop_rax, g_store, g_store_off, g_syscall,
-                 g_syscall_xor, g_clobber };
+                 g_syscall_xor, g_call_rax, g_push_jmp, g_call_clobber, g_clobber };
 int main(){ return (int)(uintptr_t)keep[0]; }

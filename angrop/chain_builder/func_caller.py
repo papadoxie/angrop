@@ -186,6 +186,13 @@ class FuncCaller(Builder):
         :param needs_return: whether to continue the ROP after invoking the function
         :return: a RopChain which invokes the function with the arguments
         """
+        # under an opted-into CET (cet=True), a stack/ret call chain faults; route to the
+        # ret-free COP call path (C10). Byte-identical when off.
+        if self.arch.cet_forced:
+            return self.chain_builder._jop_setter.func_call(
+                address, args, needs_return=kwargs.get("needs_return", False),
+                preserve_regs=kwargs.get("preserve_regs"))
+
         symbol = None
         # is it a symbol?
         if isinstance(address, str):
