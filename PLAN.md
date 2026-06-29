@@ -620,16 +620,18 @@ way — `execve` and `func_call` are worked examples, not special cases):*
 
 ### Phase 4 — Validation
 
-- `JopChain.verify()` re-checks the full C6 gate: no *unbalanced* `pop_pc` (terminal-gadget and COP
+- `JopChain.verify()` re-checks the **static structural half** of the C6 gate (build-independent,
+  fail-closed; called by `_build_jop_chain`): no *unbalanced* `pop_pc` (terminal-gadget and COP
   balanced-`call`/`ret` exemptions, C6.1/C10); every table target **and `D`** are `has_endbr`; `R`/`Rd`
-  preserved by every functional gadget and by `D` (C8), and callee-saved if the chain has a COP step
-  (C10); branch-free; single-successor stepping; table laid at stride `s`; the table appears as a
-  **precondition** (`table_addrs`), never in chain-written `mem_writes` (C9); and `exec()` — staging
-  the table + initial regs (`Rd=table_ptr−δ`, `R=D.addr`, entry `pc=D`) — reaches **the requested
-  primitive's goal state** (e.g. `set_regs`: the requested registers hold their values; `write_to_mem`:
-  the bytes are in memory; `do_syscall(n,args)`: syscall `n` with `args`; `execve`: `rax==SYS_execve`,
-  `rdi→"/bin/sh"`, `rsi→argv`, `rdx→envp`; `func_call(f,args)`: `f` entered with `args`). The terminal
-  gadget is exempt from the "must return to `D`" requirement (P7).
+  preserved by every functional gadget and by `D` (C8); branch-free; table laid at stride `s`; the
+  table appears as a **precondition** (`table_addrs`), never in chain-written `mem_writes` (C9). The
+  terminal gadget is exempt from the "must return to `D`" requirement (P7).
+- The **dynamic half** — single-successor ret-free stepping (C6.6) and reaching **the requested
+  primitive's goal state** (`set_regs`: registers hold their values; `write_to_mem`: bytes in memory;
+  `do_syscall(n,args)`: syscall `n` with `args`; `execve`: `rax==SYS_execve`, `rdi→"/bin/sh"`; `func_call(f,args)`:
+  `f` entered with `args`; `pivot`: `rsp` relocated; `shift`: `rsp` advanced) — is established by `exec()`
+  (which fails closed on any fork) and the builder's `verify_fn`, since a standalone `verify()` cannot
+  see the requested goal. (Callee-saved `R`/`Rd` for a COP step, C10, is a future tightening.)
 - Gracefully `raise RopException("no viable dispatcher/functional gadget set")` (with a
   clear message) when the binary lacks the required gadget shapes — JOP is binary-dependent.
 

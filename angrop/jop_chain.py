@@ -238,6 +238,55 @@ class JopChain(RopChain):
                 raise RopException("JOP exec exceeded step budget")
         return cur
 
+    def verify(self):
+        """
+        Fail-closed re-check of the ret-free JOP **structural** invariant (the static half of
+        C6), independent of how the chain was built -- defense in depth. Raises RopException on
+        any violation; returns True if the chain is structurally a valid ret-free JOP chain.
+        The DYNAMIC half (single-successor ret-free execution, C6.6, and reaching the requested
+        primitive's goal state) is established by exec() and the builder's verify_fn -- it
+        cannot live in a standalone verify() because the chain does not store its requested
+        goal. _build_jop_chain calls this static gate; the builder's verify_fn then exec()s.
+
+        Checks: the dispatcher D and every table target are endbr (C6.2); every NON-terminal
+        table gadget is functional (jmp_reg, branch-free) and preserves R/Rd (C6.1/C6.5/C8) --
+        the terminal (a syscall or COP call gadget, last entry) is exempt from returning to D
+        (P7/C10); the table stride matches D; and the dispatch table is a precondition
+        (table_addrs), never overlapping a chain mem_write (C9).
+        """
+        D = self.dispatcher
+        by_addr = {g.addr: g for g in self._gadgets}
+        if not getattr(D, "has_endbr", False):
+            raise RopException("JOP verify: the dispatcher is not an endbr target (C6.2)")
+        if self.stride != D.dispatch_stride:
+            raise RopException("JOP verify: table stride does not match the dispatcher")
+        n = len(self.table_addrs)
+        for i, addr in enumerate(self.table_addrs):
+            g = by_addr.get(addr)
+            if g is None:
+                raise RopException(f"JOP verify: table entry {addr:#x} is not among the chain gadgets")
+            if not getattr(g, "has_endbr", False):
+                raise RopException(f"JOP verify: table entry {addr:#x} is not an endbr target (C6.2)")
+            if self.terminal and i == n - 1:
+                continue  # the terminal (syscall/COP call) is exempt from returning to D
+            if g.transit_type != "jmp_reg":
+                raise RopException(f"JOP verify: table entry {addr:#x} is not functional (unbalanced pop_pc, C6.1)")
+            # consistent with is_functional: a None (unknown) has_conditional_branch is treated
+            # as branch-free here too. Tightening this to fail-closed on None belongs at the
+            # analysis source (so the build and verify agree), not only in verify -- backlog.
+            if g.has_conditional_branch:
+                raise RopException(f"JOP verify: table entry {addr:#x} has a conditional branch (C6.5)")
+            if self.R in g.changed_regs or self.dispatch_reg in g.changed_regs:
+                raise RopException(f"JOP verify: table entry {addr:#x} clobbers the dispatch machinery R/Rd (C8)")
+        # C9: the dispatch table is a precondition, never written by the chain
+        lo = min(self.table_ptr, self.table_ptr + self.stride * (n - 1))
+        hi = lo + abs(self.stride) * (n - 1) + self._p.arch.bytes
+        for waddr, wdata in self.mem_writes:
+            wlen = len(wdata) if hasattr(wdata, "__len__") else self._p.arch.bytes
+            if waddr < hi and waddr + wlen > lo:
+                raise RopException("JOP verify: a chain mem_write overlaps the dispatch table (C9)")
+        return True
+
     def setup(self):
         """
         The structured bootstrap the attacker must stage (instead of a flat buffer):
