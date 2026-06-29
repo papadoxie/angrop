@@ -278,13 +278,21 @@ class JopChain(RopChain):
                 raise RopException(f"JOP verify: table entry {addr:#x} has a conditional branch (C6.5)")
             if self.R in g.changed_regs or self.dispatch_reg in g.changed_regs:
                 raise RopException(f"JOP verify: table entry {addr:#x} clobbers the dispatch machinery R/Rd (C8)")
-        # C9: the dispatch table is a precondition, never written by the chain
-        lo = min(self.table_ptr, self.table_ptr + self.stride * (n - 1))
-        hi = lo + abs(self.stride) * (n - 1) + self._p.arch.bytes
+        # C9: the dispatch table is a precondition, never written by the chain. Check each
+        # table WORD individually (a strided table is sparse -- the gaps between entries are
+        # not part of the table), and size the write correctly (a claripy BV's len() is bits).
+        arch_bytes = self._p.arch.bytes
+        table_words = [self.table_ptr + k * self.stride for k in range(n)]
         for waddr, wdata in self.mem_writes:
-            wlen = len(wdata) if hasattr(wdata, "__len__") else self._p.arch.bytes
-            if waddr < hi and waddr + wlen > lo:
-                raise RopException("JOP verify: a chain mem_write overlaps the dispatch table (C9)")
+            if hasattr(wdata, "length"):          # claripy BV: .length is in bits
+                wlen = wdata.length // 8
+            elif hasattr(wdata, "__len__"):       # bytes
+                wlen = len(wdata)
+            else:
+                wlen = arch_bytes
+            for tw in table_words:
+                if waddr < tw + arch_bytes and waddr + wlen > tw:
+                    raise RopException("JOP verify: a chain mem_write overlaps the dispatch table (C9)")
         return True
 
     def setup(self):
