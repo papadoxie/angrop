@@ -36,6 +36,10 @@ class Pivot(Builder):
         self._pivot_gadgets = self.filter_gadgets(self.chain_builder.pivot_gadgets)
 
     def pivot(self, thing):
+        # under an opted-into CET (cet=True), a stack/ret pivot faults; route to the ret-free
+        # JOP pivot (C11). Byte-identical when off.
+        if self.arch.cet_forced:
+            return self.chain_builder._jop_setter.pivot(thing)
         if thing.is_register:
             return self.pivot_reg(thing)
         return self.pivot_addr(thing)

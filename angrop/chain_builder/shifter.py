@@ -65,6 +65,10 @@ class Shifter(Builder):
         preserve_regs:  what registers not to clobber
         next_pc_idx:    where is the next pc, e.g for ret, it is -1
         """
+        # under an opted-into CET (cet=True), a stack/ret shift faults; route to the ret-free
+        # JOP shift (C11). Byte-identical when off.
+        if self.arch.cet_forced:
+            return self.chain_builder._jop_setter.shift(length, preserve_regs=preserve_regs)
         preserve_regs = set(preserve_regs) if preserve_regs else set()
         arch_bytes = self.project.arch.bytes
 

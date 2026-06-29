@@ -833,6 +833,70 @@ def test_jop_execve_stages_string(jop_rop_full):
     assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
 
 
+def test_jop_shift(jop_rop_full):
+    # C11: a ret-free stack shift (add rsp, X; jmp R) advances rsp by exactly X, ret-free
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    chain = js.shift(0x18)
+    assert isinstance(chain, JopChain)
+    init = chain._stage_state()
+    init_sp = init.solver.eval(init.regs.sp)
+    final = chain.exec()
+    assert final.solver.eval(final.regs.sp) - init_sp == 0x18
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+
+
+def test_jop_pivot(jop_rop_full):
+    # C11: a ret-free stack pivot sets a pivot gadget's sp-controller reg to the new rsp, then
+    # `mov rsp, reg; jmp R` relocates rsp -- ret-free
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    new_sp = 0x500e00
+    chain = js.pivot(new_sp)
+    assert isinstance(chain, JopChain)
+    final = chain.exec()
+    assert final.solver.eval(final.regs.rsp) == new_sp
+    assert final.solver.eval(final.regs.rip) == chain.dispatcher.addr
+
+
+def test_jop_pivot_shift_route_under_cet(jop_rop_full):
+    # the public pivot/shift route through cet_forced to the JOP path
+    from angrop.jop_chain import JopChain
+    from angrop.rop_value import RopValue
+
+    rop = jop_rop_full
+    assert isinstance(rop.chain_builder.shift(0x18), JopChain)
+    assert isinstance(rop.chain_builder.pivot(RopValue(0x500e00, rop.project)), JopChain)
+
+
+def test_jop_pivot_excludes_memory_indirect(jop_rop_full):
+    # a memory-indirect pivot (mov rsp,[rax]) would land rsp at mem[target], not target. It
+    # classifies as a PivotGadget but with NO sp_reg_controllers, so the direct-register-only
+    # model excludes it (the safety is the sp_reg_controllers filter, not luck).
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    pivot_addrs = {g.addr for g in js._pivot_gadgets()}
+    assert _g(rop, "g_pivot").addr in pivot_addrs              # direct-register pivot accepted
+    assert _g(rop, "g_pivot_mem").addr not in pivot_addrs      # memory-indirect excluded
+
+
+def test_jop_pivot_shift_reject_bad_input(jop_rop_full):
+    # input/availability guards -> clean RopException
+    import claripy
+    from angrop.rop_value import RopValue
+
+    rop = jop_rop_full
+    js = rop.chain_builder._jop_setter
+    with pytest.raises(RopException):
+        js.pivot(RopValue(claripy.BVS("sp", rop.project.arch.bits), rop.project))  # symbolic target
+    with pytest.raises(RopException):
+        js.shift(0x7)                                          # no gadget shifts by 7 bytes
+
+
 def test_jop_func_call_sets_args(jop_rop_full):
     # COP call (C10): set the function address (in the call-target reg) + arg regs, then
     # dispatch to a `call reg` gadget as a terminal table entry; exec stops at the call entry

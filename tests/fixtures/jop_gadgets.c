@@ -97,6 +97,24 @@ __asm__(
 "    call *%rax\n"
 "    jmp  *%rbx\n"
 ".p2align 4\n"
+".globl g_shift\n"             /* JOP shift: add rsp,0x18; jmp rbx (functional sp advance, C11) */
+"g_shift:\n"
+"    endbr64\n"
+"    add  $0x18, %rsp\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
+".globl g_pivot\n"             /* JOP pivot: mov rax,rsp (rsp=rax); jmp rbx (PivotGadget, C11) */
+"g_pivot:\n"
+"    endbr64\n"
+"    mov  %rax, %rsp\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
+".globl g_pivot_mem\n"         /* memory-INDIRECT pivot (rsp=[rax]): empty sp_reg_controllers -> excluded */
+"g_pivot_mem:\n"
+"    endbr64\n"
+"    mov  (%rax), %rsp\n"
+"    jmp  *%rbx\n"
+".p2align 4\n"
 ".globl g_clobber\n"            /* NOT a dispatcher: also clobbers rcx (changed_regs not subset {rbp}) */
 "g_clobber:\n"
 "    endbr64\n"
@@ -107,8 +125,10 @@ __asm__(
 extern void g_disp(void), g_disp_c0(void), g_disp_sub(void), g_pop_rdi(void),
             g_pop_rdi_ret(void), g_pop_rsi(void), g_pop_rdx(void), g_pop_rax(void),
             g_store(void), g_store_off(void), g_syscall(void), g_syscall_xor(void),
-            g_call_rax(void), g_push_jmp(void), g_call_clobber(void), g_clobber(void);
+            g_call_rax(void), g_push_jmp(void), g_call_clobber(void),
+            g_shift(void), g_pivot(void), g_pivot_mem(void), g_clobber(void);
 void *keep[] = { g_disp, g_disp_c0, g_disp_sub, g_pop_rdi, g_pop_rdi_ret,
                  g_pop_rsi, g_pop_rdx, g_pop_rax, g_store, g_store_off, g_syscall,
-                 g_syscall_xor, g_call_rax, g_push_jmp, g_call_clobber, g_clobber };
+                 g_syscall_xor, g_call_rax, g_push_jmp, g_call_clobber,
+                 g_shift, g_pivot, g_pivot_mem, g_clobber };
 int main(){ return (int)(uintptr_t)keep[0]; }
