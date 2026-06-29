@@ -841,6 +841,87 @@ def test_jop_chain_verify_passes_real_chain(jop_rop_full):
     assert rop.write_to_mem(0x500c80, (0xdeadbeef).to_bytes(8, "little")).verify()
 
 
+def _assert_ret_free(chain):
+    """Assert a JopChain transits ONLY via the dispatch table (jmp), never a `ret`/`pop_pc`
+    (the property that lets it survive a CET shadow stack), and that the dispatcher D and every
+    table entry are endbr (the IBT forward-edge requirement)."""
+    from angrop.jop_chain import JopChain
+
+    assert isinstance(chain, JopChain)
+    assert chain.verify()                              # structural ret-free invariant (C6)
+    assert chain.dispatcher.has_endbr                  # D is an endbr target
+    by_addr = {g.addr: g for g in chain._gadgets}
+    n = len(chain.table_addrs)
+    for i, addr in enumerate(chain.table_addrs):
+        g = by_addr[addr]
+        assert g.has_endbr                             # IBT: D only branches to endbr targets
+        if chain.terminal and i == n - 1:
+            continue                                   # terminal (syscall/COP call) -- exempt
+        assert g.transit_type == "jmp_reg"             # functional jmp, NOT ret/pop_pc -> no #CP
+    # DYNAMIC proof (independent of verify()): actually execute the chain and confirm no `ret`
+    # instruction ran -- a shadow stack faults on exactly that, so its absence is ret-freeness.
+    assert "Ijk_Ret" not in chain.exec().history.jumpkinds
+
+
+def test_jop_primitives_are_ret_free(jop_rop_full):
+    # the headline CET-resistance property, asserted explicitly across the whole API: every
+    # emitted JOP chain composes via the dispatch table (D's `jmp [Rd-c]` and each gadget's
+    # `jmp R`) and contains no `ret`/stack-pop_pc -- so it survives Intel CET's shadow stack
+    # (no `ret` to fault on) while every indirect target is endbr (IBT forward edge).
+    from angrop.rop_value import RopValue
+
+    rop = jop_rop_full
+    cb = rop.chain_builder
+    _assert_ret_free(rop.set_regs(rdi=0x4141414141414141, rsi=0x4242424242424242))
+    _assert_ret_free(rop.write_to_mem(0x500f00, b"ABCDEFGHIJKLMNOP"))      # multi-word
+    _assert_ret_free(cb.do_syscall(60, [1, 2, 3], needs_return=False))
+    _assert_ret_free(rop.execve())                                          # from-scratch shell
+    _assert_ret_free(cb.func_call(0x401000, [0xaa]))                        # COP call
+    _assert_ret_free(cb.pivot(RopValue(0x500e00, rop.project)))
+    _assert_ret_free(cb.shift(0x18))
+
+
+def test_jop_execve_end_to_end_shell(jop_rop_full):
+    # the full ret-free shell: stage "/bin/sh\0" + the execve syscall in ONE CET-resistant
+    # chain; exec stops at the syscall entry with the path written and the args set.
+    rop = jop_rop_full
+    chain = rop.execve()
+    _assert_ret_free(chain)
+    final = chain.exec()
+    buf = final.solver.eval(final.regs.rdi)
+    assert final.solver.eval(final.memory.load(buf, 8), cast_to=bytes) == b"/bin/sh\x00"
+    assert final.solver.eval(final.regs.rsi) == 0
+    assert final.solver.eval(final.regs.rdx) == 0
+    assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
+    # the chain genuinely ends at a real syscall gadget (not merely wherever exec stopped):
+    # table_addrs[-1] is the terminal AND must be one of the discovered syscall gadgets
+    syscall_addrs = {g.addr for g in rop.chain_builder.syscall_gadgets}
+    assert chain.terminal and chain.table_addrs[-1] in syscall_addrs
+    assert final.solver.eval(final.regs.rip) == chain.table_addrs[-1]      # exec stopped there, ret-free
+
+
+@pytest.fixture(scope="module")
+def jop_rop_legacy(jop_bin):
+    # the SAME CET-compiled binary, but with cet NOT forced -> the legacy stack/ret engine
+    proj = angr.Project(jop_bin, auto_load_libs=False)
+    rop = proj.analyses.ROP(cet=False)
+    rop.find_gadgets_single_threaded()
+    return rop
+
+
+def test_jop_routing_is_opt_in(jop_rop_legacy):
+    # C0/C9: on the SAME CET-compiled binary with cet=False, set_regs uses the LEGACY stack/ret
+    # path and returns a plain RopChain (NOT a JopChain). JOP is opt-in via cet=True, never auto
+    # -- a binary merely being CET-compiled must not silently change chain building.
+    from angrop.rop_chain import RopChain
+    from angrop.jop_chain import JopChain
+
+    rop = jop_rop_legacy
+    assert not rop.arch.cet_forced
+    chain = rop.set_regs(rdi=0x4141414141414141)    # legacy path: g_pop_rdi_ret (pop rdi; ret)
+    assert isinstance(chain, RopChain) and not isinstance(chain, JopChain)
+
+
 def test_jop_chain_verify_fails_closed(jop_rop_full):
     # JopChain.verify() must re-check the ret-free invariant and raise on a tampered chain.
     # Tamper only chain-local state or COPIED gadgets so the shared module fixture is untouched.
