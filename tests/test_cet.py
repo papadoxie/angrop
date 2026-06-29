@@ -1011,7 +1011,11 @@ def test_jop_pivot_shift_reject_bad_input(jop_rop_full):
     with pytest.raises(RopException):
         js.pivot(RopValue(claripy.BVS("sp", rop.project.arch.bits), rop.project))  # symbolic target
     with pytest.raises(RopException):
+        js.pivot([0x500e00])                                  # bad-type target (not int/str/BV/RopValue)
+    with pytest.raises(RopException):
         js.shift(0x7)                                          # no gadget shifts by 7 bytes
+    with pytest.raises(RopException):
+        js.shift("0x18")                                      # bad-type length (not an int)
 
 
 def test_jop_func_call_sets_args(jop_rop_full):

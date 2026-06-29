@@ -544,6 +544,8 @@ class JopSetter(Builder):
         side-effect-free shift gadgets are used (no register pops, no memory access), so
         `preserve_regs` is moot; chained / pop-based shifts are not supported. The verify
         executes the gadget and checks the actual rsp delta, so no clobber guard is needed."""
+        if not isinstance(length, int):
+            raise RopException("JOP shift: length must be an int")
         gadgets = self._shift_gadgets(length)
         if not gadgets:
             raise RopException(f"no ret-free shift gadget for length {length:#x}")
@@ -566,7 +568,12 @@ class JopSetter(Builder):
         the actual rsp afterwards, so the result is genuine (no clobber guard needed). A pivot
         may clobber non-sp registers (the verify checks only rsp), matching legacy pivot
         semantics -- a stack pivot is a control-transfer primitive, not register-preserving."""
-        new_sp = thing if isinstance(thing, RopValue) else rop_utils.cast_rop_value(thing, self.project)
+        # normalize the target; a bad value type would otherwise leak a bare ValueError from
+        # cast_rop_value (consistent with write_to_mem / func_call / _build_for)
+        try:
+            new_sp = thing if isinstance(thing, RopValue) else rop_utils.cast_rop_value(thing, self.project)
+        except ValueError as e:
+            raise RopException(str(e)) from e
         if new_sp.symbolic:
             raise RopException("JOP pivot requires a concrete target stack pointer")
         for pg in self._pivot_gadgets():
@@ -594,7 +601,8 @@ class JopSetter(Builder):
         final = chain.exec()
         if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
             return False
-        return final.solver.eval(final.regs.sp) == new_sp
+        # uniquely the target sp (see _verify_regs): reject if sp could differ from new_sp
+        return not final.solver.satisfiable(extra_constraints=[final.regs.sp != new_sp])
 
     def _verify_execve(self, chain, writes, reg_expect):
         """exec() the terminal chain (stops at the syscall entry) and confirm the path string
@@ -606,7 +614,9 @@ class JopSetter(Builder):
         if not self._confirm_writes(final, writes):
             return False
         for reg, val in reg_expect.items():
-            if final.solver.eval(final.registers.load(reg)) != val:
+            # uniquely-the-target (see _verify_regs): rsi/rdx are 0 here, where a single eval()
+            # could pass spuriously if the register were left unconstrained
+            if final.solver.satisfiable(extra_constraints=[final.registers.load(reg) != val]):
                 return False
         return True
 
@@ -647,7 +657,11 @@ class JopSetter(Builder):
                 if not final_val.symbolic:
                     return False
                 continue
-            if final.solver.eval(final_val) != val.concreted:
+            # reject unless the register is UNIQUELY the target value. A single eval() would
+            # pass spuriously if a register were left unconstrained and the target is 0 (eval
+            # picks 0); the satisfiability check makes the verify genuine independent of the
+            # build -- stronger than the legacy reg_setter's eval(bv != val) pattern.
+            if final.solver.satisfiable(extra_constraints=[final_val != val.concreted]):
                 return False
         return True
 
