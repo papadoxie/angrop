@@ -893,7 +893,11 @@ def test_jop_execve_end_to_end_shell(jop_rop_full):
     assert final.solver.eval(final.regs.rsi) == 0
     assert final.solver.eval(final.regs.rdx) == 0
     assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
-    assert final.solver.eval(final.regs.rip) == chain.table_addrs[-1]      # at the syscall, ret-free
+    # the chain genuinely ends at a real syscall gadget (not merely wherever exec stopped):
+    # table_addrs[-1] is the terminal AND must be one of the discovered syscall gadgets
+    syscall_addrs = {g.addr for g in rop.chain_builder.syscall_gadgets}
+    assert chain.terminal and chain.table_addrs[-1] in syscall_addrs
+    assert final.solver.eval(final.regs.rip) == chain.table_addrs[-1]      # exec stopped there, ret-free
 
 
 @pytest.fixture(scope="module")
