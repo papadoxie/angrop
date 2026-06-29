@@ -530,9 +530,13 @@ class JopSetter(Builder):
 
     def _pivot_gadgets(self):
         """functional pivot gadgets (`mov rsp, reg ; jmp R`) -- relocate rsp ret-free (C11).
-        Sourced from the pivot pool (the analyzer keeps PivotGadgets separately)."""
+        Sourced from the pivot pool (the analyzer keeps PivotGadgets separately). Requires
+        non-empty sp_reg_controllers (excludes memory-indirect pivots like `mov rsp,[reg]`,
+        which would land rsp at mem[target]); excludes symbolic-memory-access gadgets for
+        parity with the legacy Pivot.filter_gadgets."""
         return [g for g in (self.chain_builder.pivot_gadgets or [])
-                if g.has_endbr and not g.has_conditional_branch and g.sp_reg_controllers]
+                if g.has_endbr and not g.has_conditional_branch
+                and g.sp_reg_controllers and not g.has_symbolic_access()]
 
     def shift(self, length, preserve_regs=None): # pylint: disable=unused-argument
         """Ret-free stack shift (C11): run a functional `add rsp, length ; jmp R` gadget as a
@@ -559,7 +563,9 @@ class JopSetter(Builder):
         (`mov rsp, reg` / `xchg`) to a CONCRETE target; a memory-indirect pivot (`mov rsp,
         [reg]`, `pop rsp`) classifies with no sp_reg_controllers and is excluded, and a
         symbolic / pivot-to-register target raises. The verify executes the gadget and checks
-        the actual rsp afterwards, so the result is genuine (no clobber guard needed)."""
+        the actual rsp afterwards, so the result is genuine (no clobber guard needed). A pivot
+        may clobber non-sp registers (the verify checks only rsp), matching legacy pivot
+        semantics -- a stack pivot is a control-transfer primitive, not register-preserving."""
         new_sp = thing if isinstance(thing, RopValue) else rop_utils.cast_rop_value(thing, self.project)
         if new_sp.symbolic:
             raise RopException("JOP pivot requires a concrete target stack pointer")
@@ -579,7 +585,9 @@ class JopSetter(Builder):
         final = chain.exec()
         if final.solver.eval(final.regs.ip) != chain.dispatcher.addr:
             return False
-        return (final.solver.eval(final.regs.sp) - init_sp) % (1 << self.project.arch.bits) == length
+        mod = 1 << self.project.arch.bits
+        # normalize both sides so a (future) negative-length shift can't spuriously fail
+        return (final.solver.eval(final.regs.sp) - init_sp) % mod == length % mod
 
     def _verify_pivot(self, chain, new_sp):
         """exec() and confirm rsp was relocated to `new_sp`, ret-free at the dispatcher."""
