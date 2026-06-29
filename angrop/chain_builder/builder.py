@@ -740,6 +740,10 @@ class Builder:
         # per-byte constraints to _blank_state now (exec() stages from it). Raises
         # "bad chain!" so _build_for falls through to the next (D, R) -- legacy retry semantics.
         self._enforce_jop_badbytes(chain)
+        # fail-closed validation gate (C6): re-check the ret-free structural invariant on the
+        # emitted chain, independent of the build path (raises RopException on any violation,
+        # so the caller falls through to the next (D, R) like any other build failure)
+        chain.verify()
         return chain
 
     def _enforce_jop_badbytes(self, chain):

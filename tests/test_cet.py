@@ -833,6 +833,42 @@ def test_jop_execve_stages_string(jop_rop_full):
     assert final.solver.eval(final.regs.rax) == rop.arch.execve_num
 
 
+def test_jop_chain_verify_passes_real_chain(jop_rop_full):
+    # every built JOP chain passes the structural ret-free re-check (C6); _build_jop_chain
+    # already calls verify() as a gate, so a returned chain is verified by construction
+    rop = jop_rop_full
+    assert rop.set_regs(rdi=0x4141414141414141).verify()
+    assert rop.write_to_mem(0x500c80, (0xdeadbeef).to_bytes(8, "little")).verify()
+
+
+def test_jop_chain_verify_fails_closed(jop_rop_full):
+    # JopChain.verify() must re-check the ret-free invariant and raise on a tampered chain.
+    # Tamper only chain-local state or COPIED gadgets so the shared module fixture is untouched.
+    rop = jop_rop_full
+    chain = rop.set_regs(rdi=0x4141414141414141)
+    assert chain.verify()
+
+    c = chain.copy(); c.stride = c.stride ^ 1                       # stride != dispatcher
+    with pytest.raises(RopException):
+        c.verify()
+
+    c = chain.copy(); c.table_addrs = list(c.table_addrs) + [0xdeadbeef]  # entry not a gadget
+    with pytest.raises(RopException):
+        c.verify()
+
+    c = chain.copy()                                               # a non-endbr table target
+    g0 = c._gadgets[0].copy(); g0.has_endbr = False
+    c._gadgets = [g0] + c._gadgets[1:]
+    with pytest.raises(RopException):
+        c.verify()
+
+    c = chain.copy()                                               # a gadget clobbering R/Rd (C8)
+    g0 = c._gadgets[0].copy(); g0.changed_regs = set(g0.changed_regs) | {c.R}
+    c._gadgets = [g0] + c._gadgets[1:]
+    with pytest.raises(RopException):
+        c.verify()
+
+
 def test_jop_shift(jop_rop_full):
     # C11: a ret-free stack shift (add rsp, X; jmp R) advances rsp by exactly X, ret-free
     from angrop.jop_chain import JopChain
