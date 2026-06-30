@@ -334,6 +334,28 @@ def _g(rop, name):
     return rop.analyze_gadget(rop.project.loader.find_symbol(name).rebased_addr)
 
 
+def test_jop_endbr_supplement_survives_analyzer_crash(jop_rop, monkeypatch):
+    # robustness on a REAL CET binary: the endbr supplement runs serially in the main process
+    # (unlike the per-process-isolated multiprocess workers), and some endbr entries on real
+    # libc lead to syscall blocks that crash deep in angr (AssertionError). It must SKIP such
+    # an entry, not abort the whole discovery.
+    gf = jop_rop.gadget_finder
+    endbrs = list(gf._endbr_locations())
+    assert endbrs
+    boom = endbrs[0]
+    orig = gf.gadget_analyzer.analyze_gadget
+
+    def crashing(addr, *a, **k):
+        if addr == boom:
+            raise AssertionError("simulated angr crash on a syscall gadget")
+        return orig(addr, *a, **k)
+
+    monkeypatch.setattr(gf.gadget_analyzer, "analyze_gadget", crashing)
+    result = gf._supplement_endbr_gadgets([])          # must NOT raise despite the crash at `boom`
+    assert isinstance(result, list)
+    assert boom not in {g.addr for g in result}        # the crashing entry was skipped, not fatal
+
+
 @pytest.mark.parametrize("name,reg,disp,stride", [
     ("g_disp", "rbp", 0, 8),       # add rbp,8; jmp [rbp-8]  -> delta = s-c = 0
     ("g_disp_c0", "rbp", 8, 8),    # add rbp,8; jmp [rbp]    -> delta = s   = 8

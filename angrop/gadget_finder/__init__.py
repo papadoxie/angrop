@@ -414,13 +414,22 @@ class GadgetFinder:
             return gadgets
         found = {g.addr for g in gadgets}
         dropped = 0
+        errored = 0
         for addr in self._endbr_locations():
             if addr in found:
                 continue
             if deadline is not None and time.time() > deadline:
                 dropped += 1
                 continue
-            res = self.gadget_analyzer.analyze_gadget(addr)
+            # This serial pass runs in the MAIN process, so unlike the multiprocess workers
+            # (isolated per process) a single gadget's analysis crashing deep in angr -- e.g.
+            # an unresolvable concrete `syscall` number in a real libc raising AssertionError
+            # -- would abort the whole discovery. Skip such an entry instead.
+            try:
+                res = self.gadget_analyzer.analyze_gadget(addr)
+            except Exception: # pylint: disable=broad-except
+                errored += 1
+                continue
             if res is None:
                 continue
             if isinstance(res, list):
@@ -430,6 +439,8 @@ class GadgetFinder:
             found.add(addr)
         if dropped:
             l.info("endbr supplement: skipped %d candidate(s) past the find_gadgets timeout", dropped)
+        if errored:
+            l.info("endbr supplement: skipped %d endbr entr(ies) whose analysis crashed", errored)
         return gadgets
 
     #### generate addresses from slices ####

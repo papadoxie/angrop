@@ -4,3 +4,5 @@
 dist
 build
 .venv/
+libc.so.6
+run_cet_libc.py
