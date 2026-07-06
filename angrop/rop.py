@@ -224,6 +224,15 @@ class ROP(Analysis):
             self._all_gadgets = [g for g in self._all_gadgets if self.arch.addr_has_endbr(g.addr)]
             for g in self._all_gadgets:
                 g.has_endbr = True  # survivors are known endbr; no need to re-load
+            # keep _duplicates consistent with _all_gadgets: drop non-endbr equivalents so
+            # badbyte substitution in _screen_gadgets never selects a non-endbr address
+            # (which analyze_gadget would reject, silently dropping a buildable gadget)
+            filtered_dups = {}
+            for h, addrs in self._duplicates.items():
+                eqs = {a for a in addrs if self.arch.addr_has_endbr(a)}
+                if eqs:
+                    filtered_dups[h] = eqs
+            self._duplicates = filtered_dups
         elif self.arch.ibt:
             for g in self._all_gadgets:
                 g.has_endbr = self.arch.addr_has_endbr(g.addr)

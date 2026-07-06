@@ -451,6 +451,8 @@ def test_ibt_cache_cross_flag(tmp_path):                  # C4 (cross-flag re-ta
     addrs = {g.addr for g in fe._all_gadgets}
     assert 0x400000 in addrs and 0x400006 not in addrs
     assert all(g.has_endbr for g in fe._all_gadgets)
+    # _duplicates stays consistent with _all_gadgets (no non-endbr equivalents left)
+    assert all(fe.arch.addr_has_endbr(a) for eqs in fe._duplicates.values() for a in eqs)
 
 
 def test_ibt_non_x86_noop():                              # C5
