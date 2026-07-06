@@ -1,3 +1,4 @@
+import re
 import pickle
 import inspect
 import logging
@@ -23,7 +24,7 @@ class ROP(Analysis):
 
     def __init__(self, only_check_near_rets=True, max_block_size=None, max_sym_mem_access=None,
                  fast_mode=None, rebase=None, is_thumb=False, kernel_mode=False, stack_gsize=80,
-                 cond_br=False, max_bb_cnt=2
+                 cond_br=False, max_bb_cnt=2, ibt=False, cet=None, force_endbr=False
                  ):
         """
         Initializes the rop gadget finder
@@ -39,8 +40,23 @@ class ROP(Analysis):
         :param stack_gsize: change the maximum allowable stack change for gadgets, where
                             the max stack_change = stack_gsize * arch.bytes
         :param cond_br: whether to support conditional branches, this option impacts gadget finding speed significantly
+        :param ibt: opt-in Intel IBT (endbr) awareness (x86/amd64 only). Tags every gadget with
+                    has_endbr and, at chain-build time, rejects indirect-branch transitions
+                    (jmp_reg / jmp_mem) that land on a non-endbr gadget. ret transitions are exempt.
+                    No gadget is dropped; default (off) behavior is byte-for-byte unchanged.
+        :param cet: alias/superset of ibt accepting a CET feature string; enables ibt when it
+                    names IBT, e.g. True, "ibt", "full", "ibt+shstk" (a bare "shstk" does not).
+        :param force_endbr: blanket find-time exclusion of every gadget whose entry is not an
+                            endbr landing pad (x86/amd64 only). Independent of ibt.
         :return:
         """
+        require_endbr = bool(ibt) or cet is True
+        if isinstance(cet, str):
+            tokens = re.split(r'[\s,+|]+', cet.strip().lower())
+            if 'ibt' in tokens or 'full' in tokens:
+                require_endbr = True
+            elif not any(t in ('shstk', 'ss', '') for t in tokens):
+                l.warning("unrecognized cet value %r; expected 'ibt', 'shstk', or 'ibt+shstk'", cet)
 
         # private list of RopGadget's
         self._all_gadgets: list[RopGadget] = [] # all types of gadgets
@@ -60,7 +76,8 @@ class ROP(Analysis):
         self.gadget_finder = GadgetFinder(self.project, fast_mode=fast_mode, only_check_near_rets=only_check_near_rets,
                                           max_block_size=max_block_size, max_sym_mem_access=max_sym_mem_access,
                                           is_thumb=is_thumb, kernel_mode=kernel_mode, stack_gsize=stack_gsize,
-                                          cond_br=cond_br, max_bb_cnt=max_bb_cnt)
+                                          cond_br=cond_br, max_bb_cnt=max_bb_cnt,
+                                          require_endbr=require_endbr, force_endbr=force_endbr)
         self.arch = self.gadget_finder.arch
 
         # chain builder
@@ -186,6 +203,16 @@ class ROP(Analysis):
         self._duplicates = tup[1]
         for g in self._all_gadgets:
             g.project = self.project
+        # cross-flag correctness: load_gadgets bypasses _analyze_gadget, so a cache saved
+        # under default flags carries has_endbr=False and was never force_endbr-filtered.
+        # Re-tag (and, for force_endbr, re-filter) here so the loaded set matches a fresh
+        # find. No-op when neither flag is set (C0).
+        if self.arch.ibt or self.arch.force_endbr:
+            if self.arch.force_endbr:
+                self._all_gadgets = [g for g in self._all_gadgets
+                                     if self.arch.addr_has_endbr(g.addr)]
+            for g in self._all_gadgets:
+                g.has_endbr = self.arch.addr_has_endbr(g.addr)
         self._screen_gadgets()
 
     def save_gadgets(self, path):

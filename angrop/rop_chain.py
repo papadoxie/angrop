@@ -77,6 +77,7 @@ class RopChain:
             if not result._blank_state.satisfiable():
                 raise RopException("cannot use a rop_block with different constraints yet")
 
+        result._check_ibt_seq(result._gadgets)
         return result
 
     def set_timeout(self, timeout):
@@ -106,9 +107,30 @@ class RopChain:
             self._values[idx] = value
 
         self._gadgets.append(gadget)
+        self._check_ibt_seq(self._gadgets[-2:])  # only the new seam is O(1)
 
     def set_gadgets(self, gadgets: list[RopGadget]):
         self._gadgets = gadgets
+        self._check_ibt_seq(self._gadgets)
+
+    def _check_ibt_seq(self, gadgets):
+        """
+        Under IBT (arch.ibt), reject indirect-branch transitions that land on a non-endbr
+        gadget. This is the centralized enforcement point for jmp_reg transitions: it runs
+        on every write to a chain's ordered gadget list. No-op unless arch.ibt is set (C0).
+
+        Only jmp_reg's target is the adjacent _gadgets entry. jmp_mem's real target (the
+        shifter) lives in memory, not in _gadgets, and the following entry is reached via
+        the shifter's ret (exempt) -- jmp_mem is enforced in builder._normalize_jmp_mem.
+        pop_pc (ret) transitions are never checked (IBT exempts ret targets).
+        """
+        if not self._builder.arch.ibt:
+            return
+        for prev, cur in zip(gadgets, gadgets[1:]):
+            if prev.transit_type == 'jmp_reg' and not cur.has_endbr:
+                raise RopException(
+                    "IBT violation: indirect branch from %#x lands on non-endbr gadget %#x"
+                    % (prev.addr, cur.addr))
 
     def add_constraint(self, cons):
         """
