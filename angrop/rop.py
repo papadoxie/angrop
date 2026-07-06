@@ -52,11 +52,14 @@ class ROP(Analysis):
         """
         require_endbr = bool(ibt) or cet is True
         if isinstance(cet, str):
-            tokens = re.split(r'[\s,+|]+', cet.strip().lower())
+            tokens = [t for t in re.split(r'[\s,+|]+', cet.strip().lower()) if t]
             if 'ibt' in tokens or 'full' in tokens:
                 require_endbr = True
-            elif not any(t in ('shstk', 'ss', '') for t in tokens):
-                l.warning("unrecognized cet value %r; expected 'ibt', 'shstk', or 'ibt+shstk'", cet)
+            # warn per unrecognized token, so a typo like "ibr+shstk" is caught even
+            # though the valid "shstk" co-occurs (otherwise IBT is silently left off).
+            for t in tokens:
+                if t not in ('ibt', 'full', 'shstk', 'ss'):
+                    l.warning("unrecognized cet token %r in %r; expected 'ibt', 'shstk', or 'ibt+shstk'", t, cet)
 
         # private list of RopGadget's
         self._all_gadgets: list[RopGadget] = [] # all types of gadgets
@@ -196,21 +199,30 @@ class ROP(Analysis):
         all_gadgets = self._all_gadgets
         for g in all_gadgets:
             g.project = None
-        return (all_gadgets, self._duplicates)
+        # record whether this cache was force_endbr-filtered so a mismatched load can warn
+        return (all_gadgets, self._duplicates, {'force_endbr': self.arch.force_endbr})
 
     def _load_cache_tuple(self, tup):
         self._all_gadgets = tup[0]
         self._duplicates = tup[1]
+        meta = tup[2] if len(tup) > 2 else {}  # older caches are 2-tuples
         for g in self._all_gadgets:
             g.project = self.project
+        # A force_endbr cache is a strict subset (non-endbr entries were dropped at save
+        # time and are NOT in the pickle), so loading it without force_endbr silently
+        # yields a reduced set that re-tagging cannot recover. Warn rather than mislead.
+        if meta.get('force_endbr', False) and not self.arch.force_endbr:
+            l.warning("loaded cache was saved with force_endbr=True; its gadget set is "
+                      "reduced to endbr entries and does not match a full find")
         # cross-flag correctness: load_gadgets bypasses _analyze_gadget, so a cache saved
         # under default flags carries has_endbr=False and was never force_endbr-filtered.
         # Re-tag (and, for force_endbr, re-filter) here so the loaded set matches a fresh
         # find. No-op when neither flag is set (C0).
-        if self.arch.ibt or self.arch.force_endbr:
-            if self.arch.force_endbr:
-                self._all_gadgets = [g for g in self._all_gadgets
-                                     if self.arch.addr_has_endbr(g.addr)]
+        if self.arch.force_endbr:
+            self._all_gadgets = [g for g in self._all_gadgets if self.arch.addr_has_endbr(g.addr)]
+            for g in self._all_gadgets:
+                g.has_endbr = True  # survivors are known endbr; no need to re-load
+        elif self.arch.ibt:
             for g in self._all_gadgets:
                 g.has_endbr = self.arch.addr_has_endbr(g.addr)
         self._screen_gadgets()

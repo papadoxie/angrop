@@ -391,6 +391,14 @@ class GadgetFinder:
                 do_update()
                 continue
 
+            # force_endbr perf pre-filter: skip non-endbr entries before the cache lookup
+            # and the (expensive) block lift -- addr_has_endbr only needs a memory load.
+            # Correctness is guaranteed by the _analyze_gadget gate; this only saves work.
+            # Do NOT add to skip_cache/skip_addrs (those are keyed by block bytes / shared).
+            if analyzer.arch.force_endbr and not analyzer.arch.addr_has_endbr(addr):
+                do_update()
+                continue
+
             if GadgetFinder._addr_block_in_cache(analyzer, loc, skip_cache, cache):
                 do_update()
                 continue
@@ -398,12 +406,6 @@ class GadgetFinder:
             try:
                 bl = analyzer.project.factory.block(addr, skip_stmts=True, max_size=analyzer.arch.max_block_size+0x10)
             except (SimEngineError, SimMemoryError):
-                do_update()
-                continue
-            # force_endbr perf pre-filter: skip non-endbr entries before symbolic analysis.
-            # Correctness is guaranteed by the _analyze_gadget gate; this only saves work.
-            # Do NOT add to skip_cache/skip_addrs (those are keyed by block bytes / shared).
-            if analyzer.arch.force_endbr and not analyzer.arch.addr_has_endbr(addr):
                 do_update()
                 continue
             # check size

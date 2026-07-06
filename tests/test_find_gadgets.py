@@ -406,8 +406,21 @@ def test_ibt_cet_truth_table():                           # C6
     for kw in [dict(ibt=True), dict(cet=True), dict(cet="full"),
                dict(cet="ibt"), dict(cet="ibt+shstk"), dict(cet="shstk+ibt")]:
         assert proj.analyses.ROP(**kw).arch.ibt is True, kw
-    for kw in [dict(), dict(cet=None), dict(cet=False), dict(cet="shstk")]:
+    for kw in [dict(), dict(cet=None), dict(cet=False), dict(cet="shstk"),
+               dict(cet="ibr+shstk")]:  # typo of 'ibt' must NOT enable ibt (and warns)
         assert proj.analyses.ROP(**kw).arch.ibt is False, kw
+
+
+def test_ibt_unpickled_chain_no_builder():                # F2: no crash without a builder
+    import pickle
+    from angrop.rop_chain import RopChain
+    proj = angr.load_shellcode(b"\xf3\x0f\x1e\xfa\x5f\xc3", "amd64", load_address=0x400000)
+    rop = proj.analyses.ROP(fast_mode=False, max_sym_mem_access=1, ibt=True)
+    g = rop.analyze_gadget(0x400000)
+    chain = RopChain(rop.project, rop.chain_builder._reg_setter)
+    chain2 = pickle.loads(pickle.dumps(chain))            # __getstate__ nulls _builder
+    assert chain2._builder is None
+    chain2.set_gadgets([g, g])                            # must not raise despite ibt
 
 
 def test_ibt_pickle_survives(tmp_path):                   # C4
