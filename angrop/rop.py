@@ -50,7 +50,7 @@ class ROP(Analysis):
                             endbr landing pad (x86/amd64 only). Independent of ibt.
         :return:
         """
-        require_endbr = bool(ibt) or cet is True
+        require_endbr = bool(ibt)
         if isinstance(cet, str):
             tokens = [t for t in re.split(r'[\s,+|]+', cet.strip().lower()) if t]
             if 'ibt' in tokens or 'full' in tokens:
@@ -58,8 +58,10 @@ class ROP(Analysis):
             # warn per unrecognized token, so a typo like "ibr+shstk" is caught even
             # though the valid "shstk" co-occurs (otherwise IBT is silently left off).
             for t in tokens:
-                if t not in ('ibt', 'full', 'shstk', 'ss'):
-                    l.warning("unrecognized cet token %r in %r; expected 'ibt', 'shstk', or 'ibt+shstk'", t, cet)
+                if t not in ('ibt', 'full', 'shstk'):
+                    l.warning("unrecognized cet token %r in %r; expected 'ibt', 'full', 'shstk', or e.g. 'ibt+shstk'", t, cet)
+        elif cet:  # truthy non-string (True, or any truthy) -> enable IBT, never silently off
+            require_endbr = True
 
         # private list of RopGadget's
         self._all_gadgets: list[RopGadget] = [] # all types of gadgets

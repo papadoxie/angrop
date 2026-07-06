@@ -404,7 +404,8 @@ def test_ibt_find_set_identity():                         # C0.2
 def test_ibt_cet_truth_table():                           # C6
     proj = angr.load_shellcode(b"\x5f\xc3", "amd64", load_address=0x400000)
     for kw in [dict(ibt=True), dict(cet=True), dict(cet="full"),
-               dict(cet="ibt"), dict(cet="ibt+shstk"), dict(cet="shstk+ibt")]:
+               dict(cet="ibt"), dict(cet="ibt+shstk"), dict(cet="shstk+ibt"),
+               dict(cet=1)]:  # truthy non-True must not silently leave IBT off
         assert proj.analyses.ROP(**kw).arch.ibt is True, kw
     for kw in [dict(), dict(cet=None), dict(cet=False), dict(cet="shstk"),
                dict(cet="ibr+shstk")]:  # typo of 'ibt' must NOT enable ibt (and warns)

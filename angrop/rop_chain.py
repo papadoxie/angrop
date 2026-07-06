@@ -77,7 +77,9 @@ class RopChain:
             if not result._blank_state.satisfiable():
                 raise RopException("cannot use a rop_block with different constraints yet")
 
-        result._check_ibt_seq(result._gadgets)
+        # both operands are internally IBT-valid (every _gadgets write is validated), so
+        # only the new join seam needs checking -- avoids O(n^2) re-validation on a+b+c+...
+        result._check_ibt_seq(self._gadgets[-1:] + other._gadgets[:1])
         return result
 
     def set_timeout(self, timeout):
@@ -95,6 +97,11 @@ class RopChain:
         self.payload_len += self._p.arch.bytes
 
     def add_gadget(self, gadget):
+        # validate the new seam BEFORE any mutation, so a rejected transition leaves the
+        # chain untouched (add_value below would otherwise inflate _values/payload_len)
+        if self._gadgets:
+            self._check_ibt_seq([self._gadgets[-1], gadget])
+
         value = gadget.addr
         if self._pie:
             value -= self._p.loader.main_object.mapped_base
@@ -106,7 +113,6 @@ class RopChain:
         else:
             self._values[idx] = value
 
-        self._check_ibt_seq(self._gadgets[-1:] + [gadget])  # validate the new seam first
         self._gadgets.append(gadget)
 
     def set_gadgets(self, gadgets: list[RopGadget]):

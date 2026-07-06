@@ -547,7 +547,9 @@ class GadgetAnalyzer:
 
         gadget = self._effect_analysis(gadget, init_state, final_state, ctrl_type, do_cond_branch)
         if gadget is not None and (self.arch.ibt or self.arch.force_endbr):
-            gadget.has_endbr = self.arch.addr_has_endbr(gadget.addr)
+            # under force_endbr the _analyze_gadget gate already proved this addr is endbr,
+            # so skip the redundant memory load
+            gadget.has_endbr = True if self.arch.force_endbr else self.arch.addr_has_endbr(gadget.addr)
         return gadget
 
     def _analyze_concrete_regs(self, final_state, gadget):
