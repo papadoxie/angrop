@@ -1,4 +1,5 @@
 import re
+import os
 import pickle
 import inspect
 import logging
@@ -243,6 +244,7 @@ class ROP(Analysis):
         Saves gadgets in a file.
         :param path: A path for a file where the gadgets are stored
         """
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(self._get_cache_tuple(), f)
         for g in self._all_gadgets:
